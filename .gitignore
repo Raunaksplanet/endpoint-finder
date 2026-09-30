@@ -1,0 +1,4 @@
+node_modules/
+# scan inputs & outputs (personal targets, never commit)
+*.txt
+.DS_Store

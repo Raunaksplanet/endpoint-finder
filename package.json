@@ -1,0 +1,12 @@
+{
+  "name": "endpoint-finder",
+  "version": "1.0.0",
+  "description": "Bug-bounty endpoint finder — bookmarklet logic as a headless CLI",
+  "type": "module",
+  "bin": {
+    "endpoint-finder": "./endpoint_finder.js"
+  },
+  "dependencies": {
+    "playwright": "1.59.0"
+  }
+}
