@@ -111,6 +111,39 @@ One subdir per unpacked map inside a single root:
 
 Example (`connect.sulzer.com`): 11 js → 11 maps → 1233 files.
 
+### Secrets scan (default: on, tight, JS-only)
+
+21 fixed-format patterns only (AWS `AKIA`, Stripe `sk_live`, Slack `xox`,
+GitHub `ghp_`, `AIza`, Twilio, private-key headers, `eyJ.eyJ.` JWTs…).
+Generic `api_key`/`password`/UUID noise is deliberately excluded, plus a
+placeholder reject — a finding is worth checking. Scans fetched JS bodies,
+inline `<script>` bodies, and every unpacked source file.
+
+One file, only non-empty sources, blocks separated by an `====` bar:
+
+```
+https://…/static/js/app.js
+  aws_access_key -> AKIA…
+
+================================================================================
+
+endpoint-x-output/…/server/config.js  (from https://…/app.js)
+  github_token -> ghp_…
+```
+
+No hits → no file written. `--no-secrets` disables.
+
+### Robustness at scale (100+ targets)
+
+- per-target isolation: one bad target never kills the run
+- progress checkpointed to disk every 10 targets (`[*] Progress: X/Y`)
+- outputs never overwrite (`-urls2`, `endpoint-…-output2`, …)
+- LRU-capped fetch cache, pooled secrets scan, per-host polite throttling
+  with `429/503` backoff; dead hosts fail fast (~4s TCP preflight)
+
+Tune big lists with `--wait 1` and `--no-secrets`/`--no-sourcemap`
+recon-only passes.
+
 ### Scope filter (default: `domain`)
 
 Only URLs on the target's registrable domain are kept — third-party
@@ -141,6 +174,7 @@ output (shown only with `--verbose`).
 --exclude-static         (always on, kept for compat)
 --no-sourcemap           disable .js.map auto-unpack (default: enabled, JS-only)
 --max-maps <n>           max .map files to try per run (default: 25, max 500)
+--no-secrets             disable tight secrets scan (default: enabled, JS-only)
 --fast                   old aggressive timing (12-wide maps, 100ms gaps).
                          Default is polite (2-wide maps, 1.5s/host gap,
                          429/503 backoff) to avoid WAF bans

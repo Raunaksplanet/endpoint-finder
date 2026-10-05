@@ -255,6 +255,12 @@ function targetHostname(raw) {
   try {
     if (/^https?:\/\//i.test(s)) return new URL(s).hostname.toLowerCase();
     if (s.startsWith('//')) return new URL(`https:${s}`).hostname.toLowerCase();
+    if (s.startsWith('[')) {
+      // bracketed IPv6 literal, optional port/path: [::1]:8080/x
+      const m = s.match(/^\[([^\]]+)\]/);
+      if (m) return m[1].toLowerCase();
+      return '';
+    }
     return s.split('/')[0].split(':')[0].toLowerCase();
   } catch {
     return '';
@@ -455,6 +461,104 @@ function subdirForJs(jsUrl, taken) {
 }
 
 // ---------------------------------------------------------------------------
+// Secrets scan (JS-only, tight high-precision regexes — no generic noise)
+// Only fixed-format keys: long distinctive prefixes + exact lengths.
+// Generic `api_key`/`password`/UUID patterns are DELIBERATELY excluded.
+// ---------------------------------------------------------------------------
+const SECRET_PATTERNS = [
+  ['aws_access_key', /((?:AKIA|ASIA)[0-9A-Z]{16})/g],
+  ['aws_mws_token', /(amzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/g],
+  ['google_api_key', /(AIza[0-9A-Za-z_-]{35})/g],
+  ['google_oauth', /(ya29\.[0-9A-Za-z_-]{20,})/g],
+  ['firebase_fcm', /(AAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{140})/g],
+  ['github_token', /((?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36})/g],
+  ['slack_token', /(xox[baprs]-[0-9A-Za-z-]{10,48})/g],
+  ['slack_webhook', /(https:\/\/hooks\.slack\.com\/services\/T[A-Z0-9]{8}\/B[A-Z0-9]{8}\/[A-Za-z0-9]{24})/g],
+  ['stripe_live', /(sk_live_[0-9a-zA-Z]{24})/g],
+  ['stripe_restricted', /(rk_live_[0-9a-zA-Z]{24})/g],
+  ['stripe_test', /(sk_test_[0-9a-zA-Z]{24})/g],
+  ['square_secret', /(sq0csp-[0-9A-Za-z_-]{43})/g],
+  ['square_token', /(sqOatp-[0-9A-Za-z_-]{22,})/g],
+  ['square_access', /(EAAA[a-zA-Z0-9]{60})/g],
+  ['braintree_token', /(access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32})/g],
+  ['facebook_token', /(EAACEdEose0cBA[0-9A-Za-z]{20,})/g],
+  ['twilio_key', /(SK[0-9a-fA-F]{32})/g],
+  ['twilio_sid', /((?:AC|AP)[0-9a-fA-F]{32})/g],
+  ['mailgun_key', /(key-[0-9a-zA-Z]{32})/g],
+  ['private_key', /(-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY(?: BLOCK)?-----)/g],
+  ['jwt', /(eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})/g],
+];
+
+/** Reject placeholder-looking matches: 8+ identical chars in a row (XXXX…, 0000…). */
+function isPlaceholder(m) {
+  return /([A-Za-z0-9])\1{7,}/.test(m);
+}
+
+/** Scan text with tight patterns. Returns [{name, matched}] deduped, placeholders dropped. */
+function scanSecrets(text) {
+  const out = [];
+  const seen = new Set();
+  if (!text || typeof text !== 'string') return out;
+  const sample = text.length > 2_000_000 ? text.slice(0, 2_000_000) : text;
+  for (const [name, rx] of SECRET_PATTERNS) {
+    rx.lastIndex = 0;
+    let m;
+    while ((m = rx.exec(sample)) !== null) {
+      const hit = m[1] || m[0];
+      if (!hit || hit.length > 4000) continue;
+      if (isPlaceholder(hit)) continue;
+      const key = name + '\0' + hit;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ name, matched: hit });
+      if (out.length > 200) return out;
+      if (m[0].length === 0) rx.lastIndex++;
+    }
+  }
+  return out;
+}
+
+/** Secrets sibling: <base>-urls.txt -> <base>-secrets.txt (first free, never overwrites). */
+function secretsSiblingFilename(outUrls) {
+  const dir = path.dirname(outUrls);
+  const baseDir = (!dir || dir === '' || dir === '.') ? '.' : dir;
+  const file = path.basename(outUrls);
+  let name;
+  if (/urls/i.test(file)) name = file.replace(/urls/i, 'secrets');
+  else {
+    const dot = file.lastIndexOf('.');
+    name = dot > 0 ? `${file.slice(0, dot)}-secrets${file.slice(dot)}` : `${file}-secrets.txt`;
+  }
+  let full = path.join(baseDir, name);
+  if (!fs.existsSync(full)) return full;
+  const dot = name.lastIndexOf('.');
+  const b = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : '.txt';
+  let n = 2;
+  while (fs.existsSync(path.join(baseDir, `${b}${n}${ext}`))) n++;
+  return path.join(baseDir, `${b}${n}${ext}`);
+}
+
+function walkFiles(root) {
+  const out = [];
+  const stack = [root];
+  while (stack.length) {
+    const cur = stack.pop();
+    let entries;
+    try { entries = fs.readdirSync(cur, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      const p = path.join(cur, e.name);
+      if (e.isDirectory()) stack.push(p);
+      else if (e.isFile()) {
+        try { if (fs.statSync(p).size > 2_000_000) continue; } catch { continue; }
+        out.push(p);
+      }
+    }
+  }
+  return out.sort();
+}
+
+// ---------------------------------------------------------------------------
 // Auto-tuned parallelism + per-host rate limiting (no user flags).
 // Pages run on parallel workers; requests to the SAME host are spaced out
 // with jitter so scans stay fast across hosts without tripping IP bans.
@@ -498,18 +602,27 @@ class HostThrottle {
   }
 }
 
-/** Bounded parallel map (fixed pool, preserves order). */
+/** Bounded parallel map (fixed pool, preserves order).
+ *  Per-item failures are isolated (never reject the pool) so one bad
+ *  input can't kill a 100-target run. */
 async function mapPool(items, size, fn) {
   const out = new Array(items.length);
   let next = 0;
-  const n = Math.min(size, items.length);
+  let failed = 0;
+  const n = Math.min(Math.max(1, size), items.length);
   await Promise.all(Array.from({ length: n }, async () => {
     while (true) {
       const idx = next++;
       if (idx >= items.length) return;
-      out[idx] = await fn(items[idx], idx);
+      try {
+        out[idx] = await fn(items[idx], idx);
+      } catch {
+        failed++;
+        out[idx] = undefined;
+      }
     }
   }));
+  if (failed > 0 && globalThis.__VERBOSE) info(`[WARN] ${failed} pooled task(s) failed (isolated, run continues)`);
   return out;
 }
 
@@ -567,7 +680,9 @@ async function fetchTextRetry(url, timeoutSec, maxBytes = 8_000_000, retries = 2
 }
 
 /** Throttled + globally cached JS fetch (same CDN file fetched once per run).
- *  Failures are NOT cached, so another target sharing the file retries it. */
+ *  Failures are NOT cached, so another target sharing the file retries it.
+ *  Cache is LRU-capped so 100-target runs can't balloon memory. */
+const MAX_CACHE_ENTRIES = 400;
 function fetchText(url, timeoutSec, maxBytes = 8_000_000) {
   let p = jsCache.get(url);
   if (!p) {
@@ -578,6 +693,10 @@ function fetchText(url, timeoutSec, maxBytes = 8_000_000) {
       return text;
     })();
     jsCache.set(url, p);
+    if (jsCache.size > MAX_CACHE_ENTRIES) {
+      const oldest = jsCache.keys().next().value;
+      jsCache.delete(oldest);
+    }
   }
   return p;
 }
@@ -642,6 +761,7 @@ function parseArgs(argv) {
     excludeStatic: false,
     sourcemap: true,
     maxMaps: 25,
+    secrets: true,
     fast: false,
     scope: 'domain', // domain | host | all
     quiet: false,
@@ -685,6 +805,7 @@ function parseArgs(argv) {
       case '--exclude-static': args.excludeStatic = true; i++; break;
       case '--no-sourcemap': args.sourcemap = false; i++; break;
       case '--max-maps': args.maxMaps = Math.min(500, Math.max(0, parseInt(need(t), 10) || 0)); i++; break;
+      case '--no-secrets': args.secrets = false; i++; break;
       case '--fast': args.fast = true; i++; break;
       case '--scope': {
         const v = need(t).toLowerCase();
@@ -762,6 +883,7 @@ Options:
   --exclude-static         (always on, kept for compat) multimedia/style/font/xml filtered, pdf+PII kept
   --no-sourcemap           disable .js.map auto-unpack (default: enabled, JS-only)
   --max-maps <n>           max .map files to try per run (default: 25, max 500, 0=unlimited->capped 500)
+  --no-secrets             disable tight secrets scan (default: enabled, JS-only)
   --fast                   old aggressive timing (12-wide maps, 100ms gaps). Default is polite
                          (2-wide maps, 1.5s/host gap, 429/503 backoff) to avoid WAF bans
   --scope <mode>           domain (default): keep target's registrable domain only,
@@ -883,6 +1005,7 @@ async function processSingleUrl(targetUrl, browser, args) {
   const foundRaw = new Set();
   const scriptSrcs = new Set();
   const discoveredJs = new Set(); // absolute .js URLs found in text (2nd bookmarklet)
+  const inlineSecrets = []; // tight secret hits inside inline <script> bodies (fetched JS is scanned later)
   const networkJs = new Set();
   let finalUrl = targetUrl;
 
@@ -1004,6 +1127,13 @@ async function processSingleUrl(targetUrl, browser, args) {
             scriptSrcs.add(u);
             discoveredJs.add(u);
           }
+          // inline bodies are never fetched, so scan them here (small, sync, capped)
+          if (args.secrets && body.length <= 500_000) {
+            let hits;
+            try { hits = scanSecrets(body); } catch { hits = []; }
+            if (hits.length > 0) inlineSecrets.push({ header: `${finalUrl} (inline)`, hits });
+            if (inlineSecrets.length >= 50) break;
+          }
         }
       } catch { /* ignore */ }
     }
@@ -1067,7 +1197,7 @@ async function processSingleUrl(targetUrl, browser, args) {
       absolute.add(u);
     }
 
-    return { ok: true, finalUrl, jsCount: earlyList.length + restList.length + jsList2.length, rawCount: foundRaw.size, urls: absolute };
+    return { ok: true, finalUrl, jsCount: earlyList.length + restList.length + jsList2.length, rawCount: foundRaw.size, urls: absolute, inlineSecrets };
   } finally {
     try { await page.close(); } catch { /* ignore */ }
     try { await context.close(); } catch { /* ignore */ }
@@ -1180,11 +1310,12 @@ async function main() {
   const mapPoolSize = args.fast ? JS_POOL_SIZE : MAP_POOL_SIZE;
   const mode = args.fast ? 'fast' : 'polite';
   info(
-    `[*] Targets: ${targets.length} | workers=${numWorkers} js-pool=${JS_POOL_SIZE} map-pool=${mapPoolSize} (${mode}) rate-limit=per-host+${JITTER_MS}ms-jitter | wait=${args.wait}s | timeout=${args.timeout}s | strict=${args.strict} | scope=${args.scope} | out=${outUrls} + ${outJs} | sourcemap=${args.sourcemap ? `on(max-${args.maxMaps})->${unpackDir}` : 'off'}`,
+    `[*] Targets: ${targets.length} | workers=${numWorkers} js-pool=${JS_POOL_SIZE} map-pool=${mapPoolSize} (${mode}) rate-limit=per-host+${JITTER_MS}ms-jitter | wait=${args.wait}s | timeout=${args.timeout}s | strict=${args.strict} | scope=${args.scope} | out=${outUrls} + ${outJs} | sourcemap=${args.sourcemap ? `on(max-${args.maxMaps})->${unpackDir}` : 'off'} | secrets=${args.secrets ? 'on' : 'off'}`,
   );
 
   const urlResults = new Set();
   const jsResults = new Set();
+  const inlineSecretsAll = [];
   const droppedHosts = new Set(); // filtered third-party hosts, log summary only
   let browser;
   try {
@@ -1224,7 +1355,23 @@ async function main() {
   });
 
   // worker pool (auto-sized; per-host throttle keeps it IP-ban safe)
+  // progress is checkpointed to disk every 10 targets so long runs survive crashes.
   let next = 0;
+  let doneCount = 0;
+  let saveChain = Promise.resolve();
+  const checkpoint = () => {
+    doneCount++;
+    if (doneCount % 10 === 0 || doneCount === targets.length) {
+      const n = doneCount;
+      saveChain = saveChain.then(() => {
+        try {
+          writeList(outUrls, urlResults);
+          writeList(outJs, jsResults);
+        } catch { /* final save retries */ }
+      }).catch(() => {});
+      info(`[*] Progress: ${n}/${targets.length} targets (${urlResults.size} urls, ${jsResults.size} js)`);
+    }
+  };
   info(tableHeader());
   const workers = Array.from(
     { length: Math.min(numWorkers, targets.length) },
@@ -1234,10 +1381,21 @@ async function main() {
         const idx = next++;
         if (idx >= targets.length) return;
         const input = targets[idx];
-        const r = await processTarget(input, browser, args);
+        let r;
+        try {
+          r = await processTarget(input, browser, args);
+        } catch (e) {
+          // isolated: a throwing target must never kill the run
+          const msg = String(e?.message?.split('\n')[0] || e);
+          if (globalThis.__QUIET) console.log(`[FAIL] ${short(input)} (${msg})`);
+          else console.log(failRow(input, msg));
+          checkpoint();
+          continue;
+        }
         if (!r.ok) {
           if (globalThis.__QUIET) console.log(`[FAIL] ${short(input)} (${r.error})`);
           else console.log(failRow(input, r.error));
+          checkpoint();
           continue;
         }
         let added = 0;
@@ -1254,23 +1412,33 @@ async function main() {
           if (isJsFile(u)) jsResults.add(u);
           else urlResults.add(u);
         }
+        if (Array.isArray(r.inlineSecrets)) {
+          for (const s of r.inlineSecrets) {
+            if (s && typeof s.header === 'string' && Array.isArray(s.hits) && s.hits.length > 0) {
+              inlineSecretsAll.push(s);
+            }
+          }
+        }
         added = (urlResults.size + jsResults.size) - before;
         info(okRow(r.finalUrl, r.jsCount, r.rawCount, scoped, added));
+        checkpoint();
       }
     },
   );
   await Promise.all(workers);
+  await saveChain.catch(() => {});
 
   // sourcemap auto-unpack: every in-scope .js -> .js.map (JS-only, like unwebpack)
   // polite by default: 2-wide, 1.5s/host gap, 429/503 backoff. --fast restores 12-wide.
   let mapExtra = '';
+  let mapsOk = 0;
+  let filesOk = 0;
+  const jsToSub = new Map();
   if (args.sourcemap && !interrupted && jsResults.size > 0) {
     const cap = args.maxMaps === 0 ? 500 : args.maxMaps;
     const jsList = [...jsResults].sort().slice(0, cap);
     info(`[*] Sourcemaps (${mode}): trying ${jsList.length} .js.map -> ${unpackDir}/<js>/`);
     const taken = new Set();
-    let mapsOk = 0;
-    let filesOk = 0;
     const foundMaps = [];
     await mapPool(jsList, mapPoolSize, async (jsUrl) => {
       if (interrupted) return;
@@ -1293,6 +1461,7 @@ async function main() {
           mapsOk++;
           filesOk += n;
           foundMaps.push(mapUrl);
+          jsToSub.set(jsUrl, sub);
           info(`[MAP] ${short(jsUrl, 70)} -> ${short(mapUrl, 70)} (${n} files in ${sub}/)`);
           break; // one good map per js is enough
         }
@@ -1306,6 +1475,83 @@ async function main() {
     }
     mapExtra = ` + ${mapsOk} maps/${filesOk} files (${unpackDir}/)`;
     if (mapsOk === 0) info(`[*] Sourcemaps: no valid .map with sourcesContent found`);
+  }
+
+  // secrets scan (tight, JS-only): fetched JS bodies + unpacked sources -> single file
+  // format: <url-or-file> + hits, blocks separated by 2 blank lines + ==== bar. Empty sources skipped.
+  let secretsExtra = '';
+  let outSecrets = secretsSiblingFilename(outUrls);
+  if (args.secrets && !interrupted) {
+    const BAR = '='.repeat(80);
+    const blocks = [];
+    const seenSrc = new Set();
+    // 1. fetched JS bodies (cached, no extra traffic) — pooled, not sequential:
+    // a sequential loop here costs 400ms+ per body on same-host lists.
+    const jsListAll = [...jsResults].sort();
+    info(`[*] Secrets (tight): scanning ${jsListAll.length} js bodies${mapsOk > 0 ? ' + unpacked sources' : ''} -> ${outSecrets}`);
+    const jsBlocks = await mapPool(jsListAll, JS_POOL_SIZE, async (jsUrl) => {
+      if (interrupted) return null;
+      let body = null;
+      try { body = await fetchText(jsUrl, args.jsTimeout); } catch { body = null; }
+      if (!body) return null;
+      let hits;
+      try { hits = scanSecrets(body); } catch { return null; }
+      if (hits.length === 0) return null;
+      return { header: jsUrl, hits };
+    });
+    for (const b of jsBlocks) {
+      if (!b || seenSrc.has(b.header)) continue;
+      seenSrc.add(b.header);
+      blocks.push(`${b.header}\n${b.hits.map((h) => `  ${h.name} -> ${h.matched}`).join('\n')}`);
+    }
+    // 1b. inline <script> hits collected in workers (never fetched, scanned in-page)
+    for (const b of inlineSecretsAll) {
+      if (!b || seenSrc.has(b.header)) continue;
+      seenSrc.add(b.header);
+      blocks.push(`${b.header}\n${b.hits.map((h) => `  ${h.name} -> ${h.matched}`).join('\n')}`);
+    }
+    blocks.sort(); // deterministic output regardless of worker/pool completion order
+    // 2. unpacked sources (local walk, in-scope code + vendor — tight regexes only)
+    try {
+      if (fs.existsSync(unpackDir)) {
+        const subToJs = new Map([...jsToSub.entries()].map(([u, s]) => [s, u]));
+        for (const f of walkFiles(unpackDir)) {
+          if (interrupted) break;
+          let text;
+          try {
+            const buf = fs.readFileSync(f);
+            if (buf.includes(0)) continue; // binary
+            text = buf.toString('utf8');
+          } catch { continue; }
+          if (!text) continue;
+          const hits = scanSecrets(text);
+          if (hits.length === 0) continue;
+          const rel = path.relative(path.dirname(unpackDir), f);
+          const sub = rel.split(path.sep)[1] || '';
+          const from = subToJs.get(sub);
+          const header = from ? `${rel}  (from ${from})` : rel;
+          if (seenSrc.has(header)) continue;
+          seenSrc.add(header);
+          blocks.push(`${header}\n${hits.map((h) => `  ${h.name} -> ${h.matched}`).join('\n')}`);
+        }
+      }
+    } catch { /* walk errors ignored */ }
+    const nHits = blocks.reduce((a, b) => a + (b.split('\n').length - 1), 0);
+    if (blocks.length > 0) {
+      const SEP = `\n\n${BAR}\n\n`;
+      try {
+        const sdir = path.dirname(outSecrets);
+        if (sdir && sdir !== '.' && sdir !== '') fs.mkdirSync(sdir, { recursive: true });
+        fs.writeFileSync(outSecrets, blocks.join(SEP) + '\n');
+      } catch (e) {
+        console.error(`Failed to write secrets: ${e?.message || e}`);
+      }
+      info(`[*] Secrets: ${blocks.length} sources, ${nHits} hits -> ${outSecrets}`);
+      secretsExtra = ` + ${nHits} secrets (${outSecrets})`;
+    } else {
+      info(`[*] Secrets: clean (0 hits, no file written)`);
+    }
+    mapExtra += secretsExtra;
   }
 
   await browser.close().catch(() => {});
