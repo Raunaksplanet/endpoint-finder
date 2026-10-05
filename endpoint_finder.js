@@ -92,9 +92,23 @@ function extractJsUrls(text) {
 const SKIP_SCHEMES = ['data:', 'blob:', 'javascript:', 'about:', 'mailto:', 'tel:', 'ws:', 'wss:'];
 
 const STATIC_EXTS = new Set([
+  // images (always noise for endpoint hunting)
   '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.ico', '.svg',
-  '.woff', '.woff2', '.ttf', '.eot', '.otf',
-  '.mp4', '.mp3', '.avi', '.mov', '.pdf', '.zip',
+  '.avif', '.tif', '.tiff', '.heic', '.heif', '.psd', '.ai', '.eps', '.cur',
+  // video
+  '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm', '.mkv', '.m4v',
+  '.3gp', '.mpg', '.mpeg', '.ogv', '.m3u8', '.mpd', '.ts',
+  // audio
+  '.mp3', '.wav', '.ogg', '.oga', '.m4a', '.aac', '.flac', '.wma', '.opus', '.mid', '.midi',
+  // fonts
+  '.woff', '.woff2', '.ttf', '.eot', '.otf', '.fon', '.pfb', '.sfnt',
+  // styles (no endpoints, pure UI noise)
+  '.css', '.scss', '.sass', '.less', '.styl',
+  // xml / feed noise (sitemaps, rss — not endpoints)
+  '.xml', '.xsd', '.xsl', '.xslt', '.dtd', '.rss', '.atom',
+  // NOTE: .pdf intentionally KEPT (often sensitive) + PII/sensitive
+  // (.json/.csv/.xls/.xlsx/.doc/.docx/.txt/.sql/.db/.log/.bak/.env/.zip)
+  // are NEVER added here.
 ]);
 
 function cleanToken(tok) {
@@ -269,11 +283,54 @@ function nextNumberedPair(dir) {
   };
 }
 
+/** Auto names never overwrite: <base>-urls.txt taken -> <base>-urls2.txt, -urls3.txt … (same for -js). */
+function firstFreePair(urls, js) {
+  if (!fs.existsSync(urls) && !fs.existsSync(js)) return { urls, js };
+  const dot = urls.lastIndexOf('.');
+  const base = dot > 0 ? urls.slice(0, dot) : urls;
+  const ext = dot > 0 ? urls.slice(dot) : '.txt';
+  const jdot = js.lastIndexOf('.');
+  const jbase = jdot > 0 ? js.slice(0, jdot) : js;
+  const jext = jdot > 0 ? js.slice(jdot) : '.txt';
+  let n = 2;
+  while (true) {
+    const u = `${base}${n}${ext}`;
+    const j = `${jbase}${n}${jext}`;
+    if (!fs.existsSync(u) && !fs.existsSync(j)) return { urls: u, js: j };
+    n++;
+    if (n > 9999) return { urls: u, js: j };
+  }
+}
+
 /** Explicit -o names the urls file; js goes to a sibling (foo.txt -> foo-js.txt). */
 function jsSiblingFilename(outFile) {
   const dot = outFile.lastIndexOf('.');
   if (dot > 0) return `${outFile.slice(0, dot)}-js${outFile.slice(dot)}`;
   return `${outFile}-js.txt`;
+}
+
+/** Unpack root: endpoint-<domain|file>-output holding one subdir per unpacked .map.
+ *  Never overwrites: taken -> -output2, -output3 … */
+function deriveUnpackDir(outUrls, targets, outputExplicit) {
+  const dir = path.dirname(outUrls);
+  const baseDir = (!dir || dir === '' || dir === '.') ? '.' : dir;
+  let name;
+  if (outputExplicit) {
+    const b = (path.basename(outUrls).replace(/\.[^.]+$/, '') || 'output');
+    name = `endpoint-${sanitizeFilename(b)}-output`;
+  } else if (targets.length > 1) {
+    const m = path.basename(outUrls).match(/urls(\d+)\.txt/i);
+    name = m ? `endpoint-scan${m[1]}-output` : 'endpoint-multi-output';
+  } else {
+    const hosts = [...new Set(targets.map(targetHostname).filter(Boolean))];
+    const base = hosts.length === 1 ? sanitizeFilename(hosts[0]) : 'endpoints';
+    name = `endpoint-${base}-output`;
+  }
+  let full = path.join(baseDir, name);
+  if (!fs.existsSync(full)) return full;
+  let n = 2;
+  while (fs.existsSync(`${full}${n}`)) n++;
+  return `${full}${n}`;
 }
 
 /** True if the URL points to a JS file (path ends .js, query ignored). */
@@ -286,17 +343,132 @@ function isJsFile(absUrl) {
 }
 
 // ---------------------------------------------------------------------------
+// Sourcemap auto-unpack (JS-only port of unwebpack_sourcemap.py)
+// Tries <file.js>.map for every in-scope .js, unpacks sourcesContent.
+// ---------------------------------------------------------------------------
+const MAX_SOURCEMAP_BYTES = 8_000_000;
+
+function mapCandidatesForJs(jsUrl, jsBody) {
+  const out = [];
+  const push = (u) => { if (u && !out.includes(u)) out.push(u); };
+  // 1. sourceMappingURL comment (same as unwebpack _detect: last line)
+  try {
+    if (jsBody) {
+      const lines = jsBody.trimEnd().split('\n');
+      const last = (lines[lines.length - 1] || '').slice(-2000);
+      const m = last.match(/\/\/#\s*sourceMappingURL=(.*)\s*$/);
+      if (m) {
+        const asset = (m[1] || '').trim();
+        if (asset && !asset.startsWith('data:')) {
+          try { push(new URL(asset, jsUrl).href); } catch { /* bad */ }
+        }
+      }
+    }
+  } catch { /* ignore */ }
+  // 2. conventional <file.js>.map (query/hash stripped)
+  try {
+    const u = new URL(jsUrl);
+    u.hash = '';
+    u.search = '';
+    if (u.pathname.toLowerCase().endsWith('.js')) {
+      u.pathname = `${u.pathname}.map`;
+      push(u.href);
+    }
+  } catch { /* ignore */ }
+  return out.slice(0, 2);
+}
+
+function sanitizeFsName(name, st) {
+  let s = (name ?? '').normalize('NFKD').replace(/[^\x00-\x7F]/g, '');
+  s = s.split(path.sep).join('_').split('/').join('_').split('\\').join('_');
+  let out = '';
+  for (const ch of s) {
+    if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || '-_.() '.includes(ch)) out += ch;
+  }
+  out = out.trim();
+  if (!/[A-Za-z0-9]/.test(out)) out = `empty_${st.n++}`;
+  if (out === '.' || out === '..') out = `empty_${st.n++}`;
+  if (out.length > 120) out = out.slice(0, 120);
+  return out;
+}
+
+function isUnderRoot(root, child) {
+  const rel = path.relative(root, child);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+function unpackSourcemapText(mapText, destRoot) {
+  let obj;
+  try { obj = JSON.parse(mapText); } catch { return 0; }
+  if (!obj || !Array.isArray(obj.sources) || !Array.isArray(obj.sourcesContent)) return 0;
+  const n = Math.min(obj.sources.length, obj.sourcesContent.length);
+  if (n === 0) return 0;
+  const root = path.resolve(destRoot);
+  fs.mkdirSync(root, { recursive: true });
+  const st = { n: 0 };
+  let wrote = 0;
+  for (let i = 0; i < n; i++) {
+    const src = obj.sources[i];
+    const content = obj.sourcesContent[i];
+    if (typeof src !== 'string' || typeof content !== 'string') continue;
+    let p = src.replace('webpack:///', '');
+    if (p.split(' ')[0] === 'external') continue; // same as unwebpack
+    let dir = '';
+    let file = '';
+    const slash = p.lastIndexOf('/');
+    if (slash >= 0) { dir = p.slice(0, slash); file = p.slice(slash + 1); }
+    else { dir = ''; file = p; }
+    if (dir.startsWith('./')) dir = dir.slice(2);
+    if (dir.startsWith('../')) dir = 'parent_dir/' + dir.slice(3);
+    if (dir.startsWith('.')) dir = '';
+    if (!file) file = `empty_${st.n++}`;
+    const dirParts = dir.split('/').filter(Boolean).map((c) => sanitizeFsName(c, st));
+    const safeFile = sanitizeFsName(file, st);
+    const dest = path.resolve(root, ...dirParts, safeFile);
+    if (!isUnderRoot(root, dest)) continue;
+    try {
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, content, 'utf8');
+      wrote++;
+    } catch { /* skip */ }
+  }
+  return wrote;
+}
+
+function subdirForJs(jsUrl, taken) {
+  let base = 'js';
+  try {
+    const u = new URL(jsUrl);
+    const host = sanitizeFilename(u.hostname) || 'host';
+    const p = u.pathname.replace(/^\//, '').replace(/\.js$/i, '') || 'root';
+    const flat = (sanitizeFilename(p).replace(/\./g, '_') || 'root').slice(0, 80);
+    base = `${host}__${flat}`;
+  } catch {
+    base = (sanitizeFilename(jsUrl) || 'js').slice(0, 80);
+  }
+  if (base.length > 100) base = base.slice(0, 100);
+  let name = base;
+  let k = 2;
+  while (taken.has(name)) name = `${base}-${k++}`;
+  taken.add(name);
+  return name;
+}
+
+// ---------------------------------------------------------------------------
 // Auto-tuned parallelism + per-host rate limiting (no user flags).
 // Pages run on parallel workers; requests to the SAME host are spaced out
 // with jitter so scans stay fast across hosts without tripping IP bans.
 // ---------------------------------------------------------------------------
 const PAGE_WORKERS_MAX = 10;  // parallel pages (auto: fewer for small lists)
-const JS_POOL_SIZE = 12;      // parallel JS fetches (global)
+const JS_POOL_SIZE = 12;      // parallel JS fetches (global, per-host throttled below)
 const JS_DISCOVERY_EXTRA = 20; // extra fetches for round-2 discovered .js files
-const PAGE_GAP_MS = 300;      // min gap between page loads on the SAME host
-const JS_GAP_MS = 100;        // min gap between JS fetches on the SAME host
-const JITTER_MS = 120;        // random extra delay (human-like spacing)
+let PAGE_GAP_MS = 800;      // min gap between page loads on the SAME host (polite, was 300)
+let JS_GAP_MS = 400;        // min gap between JS fetches on the SAME host (polite, was 100)
+let JITTER_MS = 400;        // random extra delay (human-like spacing, was 120)
 const PREFLIGHT_MS = 4000;    // TCP connect check: dead hosts fail in ~4s, not 30s
+const MAP_POOL_SIZE = 2;      // sourcemap fetches: near-sequential per run (was JS_POOL_SIZE=12 -> ban)
+let MAP_GAP_MS = 1500;      // min gap between .map fetches on the SAME host
+const MAP_RETRIES = 3;        // retry hung/429/503 maps with backoff before giving up
 
 function autoPageWorkers(nTargets) {
   return Math.min(PAGE_WORKERS_MAX, Math.max(4, nTargets));
@@ -343,7 +515,10 @@ async function mapPool(items, size, fn) {
 
 const pageThrottle = new HostThrottle();
 const jsThrottle = new HostThrottle();
+const mapThrottle = new HostThrottle();
 const jsCache = new Map(); // url -> Promise<string|null> (shared across targets)
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 async function fetchTextOnce(url, timeoutSec, maxBytes = 8_000_000) {
   const ctrl = new AbortController();
@@ -354,18 +529,41 @@ async function fetchTextOnce(url, timeoutSec, maxBytes = 8_000_000) {
       redirect: 'follow',
       headers: { 'User-Agent': globalThis.__UA },
     });
+    if (res.status === 429 || res.status === 503) {
+      const ra = res.headers.get('retry-after');
+      const waitSec = ra ? (parseInt(ra, 10) || 5) : 5;
+      try { await res.text().catch(() => {}); } catch { /* drain */ }
+      return { retry: true, waitMs: Math.min(waitSec * 1000, 30000), status: res.status };
+    }
     if (res.status >= 400) return null;
     const ctype = (res.headers.get('content-type') || '').toLowerCase();
     if (/image\/|video\/|audio\/|font|\boctet-stream\b/.test(ctype)) {
-      if (!url.toLowerCase().split('?')[0].endsWith('.js')) return null;
+      const low = url.toLowerCase().split('?')[0].split('#')[0];
+      if (!low.endsWith('.js') && !low.endsWith('.map')) return null;
     }
     const text = await res.text();
     return text.length > maxBytes ? text.slice(0, maxBytes) : text;
   } catch {
-    return null;
+    return { retry: true, waitMs: 1500, status: 0 }; // timeout/hang -> retryable
   } finally {
     clearTimeout(t);
   }
+}
+
+/** Fetch with backoff: 429/503/timeout retried, 404/other-4xx fail fast (no ban hammering). */
+async function fetchTextRetry(url, timeoutSec, maxBytes = 8_000_000, retries = 2) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const out = await fetchTextOnce(url, timeoutSec, maxBytes);
+    if (out !== null && typeof out === 'object' && out.retry) {
+      if (attempt === retries) return null;
+      const backoff = out.waitMs + Math.random() * JITTER_MS + attempt * 1500;
+      if (globalThis.__VERBOSE) console.log(`[RETRY] ${url.slice(0, 80)} (${out.status || 'timeout'}) waiting ${(backoff / 1000).toFixed(1)}s (${attempt + 1}/${retries})`);
+      await sleep(backoff);
+      continue;
+    }
+    return out;
+  }
+  return null;
 }
 
 /** Throttled + globally cached JS fetch (same CDN file fetched once per run).
@@ -375,13 +573,21 @@ function fetchText(url, timeoutSec, maxBytes = 8_000_000) {
   if (!p) {
     p = (async () => {
       await jsThrottle.acquire(hostnameOfUrl(url), JS_GAP_MS);
-      const text = await fetchTextOnce(url, timeoutSec, maxBytes);
+      const text = await fetchTextRetry(url, timeoutSec, maxBytes, 1);
       if (text === null) jsCache.delete(url);
       return text;
     })();
     jsCache.set(url, p);
   }
   return p;
+}
+
+/** Polite .map fetch: own throttle (1.5s/host), own pool, retries with backoff. NOT cached. */
+async function fetchMapText(url, timeoutSec, maxBytes = MAX_SOURCEMAP_BYTES) {
+  await mapThrottle.acquire(hostnameOfUrl(url), MAP_GAP_MS);
+  const text = await fetchTextRetry(url, timeoutSec, maxBytes, MAP_RETRIES);
+  await sleep(300 + Math.random() * 400); // breathe after each map so WAF never sees a burst
+  return text;
 }
 
 /** Fast TCP preflight: unreachable hosts fail in ~PREFLIGHT_MS instead of the
@@ -434,6 +640,9 @@ function parseArgs(argv) {
     strict: false,
     noInline: false,
     excludeStatic: false,
+    sourcemap: true,
+    maxMaps: 25,
+    fast: false,
     scope: 'domain', // domain | host | all
     quiet: false,
     userAgent: DEFAULT_UA,
@@ -474,6 +683,9 @@ function parseArgs(argv) {
       case '--strict': args.strict = true; i++; break;
       case '--no-inline': args.noInline = true; i++; break;
       case '--exclude-static': args.excludeStatic = true; i++; break;
+      case '--no-sourcemap': args.sourcemap = false; i++; break;
+      case '--max-maps': args.maxMaps = Math.min(500, Math.max(0, parseInt(need(t), 10) || 0)); i++; break;
+      case '--fast': args.fast = true; i++; break;
       case '--scope': {
         const v = need(t).toLowerCase();
         if (!['domain', 'host', 'all'].includes(v)) {
@@ -534,7 +746,8 @@ Options:
   -u, --url <url>          single target (repeatable)
   -o, --output <file>      names the urls file (a js sibling is added beside it:
                            foo.txt -> foo.txt + foo-js.txt).
-                           Single target default: <domain>-urls.txt + <domain>-js.txt;
+                           Single target default: <domain>-urls.txt + <domain>-js.txt
+                           (taken -> -urls2/-js2, -urls3/-js3 … never overwrites);
                            multi-target default: urls1.txt+js1.txt, urls2.txt+js2.txt…
                            (first free pair, never overwrites)
   --timeout <s>            per-page goto timeout (default: 30)
@@ -546,7 +759,11 @@ Options:
   --fallback               explicit https URL failing also tries http variant
   --strict                 exact bookmarklet quote handling (misses single-quoted paths)
   --no-inline              skip inline <script> bodies
-  --exclude-static         drop png/jpg/woff/mp4/... assets
+  --exclude-static         (always on, kept for compat) multimedia/style/font/xml filtered, pdf+PII kept
+  --no-sourcemap           disable .js.map auto-unpack (default: enabled, JS-only)
+  --max-maps <n>           max .map files to try per run (default: 25, max 500, 0=unlimited->capped 500)
+  --fast                   old aggressive timing (12-wide maps, 100ms gaps). Default is polite
+                         (2-wide maps, 1.5s/host gap, 429/503 backoff) to avoid WAF bans
   --scope <mode>           domain (default): keep target's registrable domain only,
                            drops third-party trackers (oracleinfinity.io, taboola…);
                            host: exact hostname only (a redirect to another
@@ -841,11 +1058,14 @@ async function processSingleUrl(targetUrl, browser, args) {
     for (const rawPath of foundRaw) {
       const abs = resolveToAbsolute(finalUrl, rawPath);
       if (!abs) continue;
-      if (args.excludeStatic && isStaticNoise(abs)) continue;
+      if (isStaticNoise(abs)) continue; // always-on: multimedia/style/font/xml filtered, pdf+PII kept
       absolute.add(abs);
     }
     // discovered absolute .js files are endpoints too (scope-filtered downstream)
-    for (const u of discoveredJs) absolute.add(u);
+    for (const u of discoveredJs) {
+      if (isStaticNoise(u)) continue; // same always-on filter (defense in depth)
+      absolute.add(u);
+    }
 
     return { ok: true, finalUrl, jsCount: earlyList.length + restList.length + jsList2.length, rawCount: foundRaw.size, urls: absolute };
   } finally {
@@ -907,14 +1127,19 @@ async function main() {
   }
   globalThis.__UA = args.userAgent;
   globalThis.__QUIET = args.quiet;
+  globalThis.__VERBOSE = args.verbose;
+  if (args.fast) {
+    PAGE_GAP_MS = 300; JS_GAP_MS = 100; JITTER_MS = 120; MAP_GAP_MS = 100;
+    info(`[*] --fast: aggressive timing restored (12-wide maps, 100ms gaps)`);
+  }
 
   const targets = await loadTargets(args);
 
-  // output files — always a urls + js pair, never combined:
+  // output files — always a urls + js pair, never combined, never overwrites
+  // (explicit -o is the only overwriting case, because you named it):
   //   explicit -o   -> that file (urls) + sibling -js file
-  //   single target -> <domain>-urls.txt + <domain>-js.txt
-  //   multi target  -> urls1.txt+js1.txt, urls2.txt+js2.txt, … (first free pair,
-  //                    never overwrites, so the next scan gets fresh files)
+  //   single target -> <domain>-urls.txt + <domain>-js.txt, then -urls2/-js2, -urls3/-js3 …
+  //   multi target  -> urls1.txt+js1.txt, urls2.txt+js2.txt, … (first free pair)
   let outUrls, outJs;
   if (args.outputExplicit && args.output) {
     outUrls = args.output;
@@ -922,7 +1147,8 @@ async function main() {
   } else if (targets.length > 1) {
     ({ urls: outUrls, js: outJs } = nextNumberedPair('.'));
   } else {
-    ({ urls: outUrls, js: outJs } = deriveOutputFilenames(targets));
+    const base = deriveOutputFilenames(targets);
+    ({ urls: outUrls, js: outJs } = firstFreePair(base.urls, base.js));
   }
 
   // never silently overwrite the input target list with results
@@ -950,8 +1176,11 @@ async function main() {
   };
 
   const numWorkers = autoPageWorkers(targets.length);
+  const unpackDir = deriveUnpackDir(outUrls, targets, args.outputExplicit);
+  const mapPoolSize = args.fast ? JS_POOL_SIZE : MAP_POOL_SIZE;
+  const mode = args.fast ? 'fast' : 'polite';
   info(
-    `[*] Targets: ${targets.length} | workers=${numWorkers} js-pool=${JS_POOL_SIZE} rate-limit=per-host+${JITTER_MS}ms-jitter | wait=${args.wait}s | timeout=${args.timeout}s | strict=${args.strict} | scope=${args.scope} | out=${outUrls} + ${outJs}`,
+    `[*] Targets: ${targets.length} | workers=${numWorkers} js-pool=${JS_POOL_SIZE} map-pool=${mapPoolSize} (${mode}) rate-limit=per-host+${JITTER_MS}ms-jitter | wait=${args.wait}s | timeout=${args.timeout}s | strict=${args.strict} | scope=${args.scope} | out=${outUrls} + ${outJs} | sourcemap=${args.sourcemap ? `on(max-${args.maxMaps})->${unpackDir}` : 'off'}`,
   );
 
   const urlResults = new Set();
@@ -972,7 +1201,7 @@ async function main() {
     if (dir && dir !== '.' && dir !== '') fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(file, [...set].sort().join('\n') + (set.size ? '\n' : ''));
   };
-  const saveAndExit = (code) => {
+  const saveAndExit = (code, extra = '') => {
     try {
       writeList(outUrls, urlResults);
       writeList(outJs, jsResults);
@@ -981,7 +1210,7 @@ async function main() {
       process.exit(4);
     }
     const dt = ((Date.now() - t0) / 1000).toFixed(1);
-    console.log(`\n[DONE] ${targets.length} targets in ${dt}s -> ${urlResults.size} urls (${outUrls}) + ${jsResults.size} js (${outJs})`);
+    console.log(`\n[DONE] ${targets.length} targets in ${dt}s -> ${urlResults.size} urls (${outUrls}) + ${jsResults.size} js (${outJs})${extra}`);
     if (args.verbose && args.scope !== 'all' && droppedHosts.size > 0) {
       info(`[SCOPE] dropped third-party (${[...droppedHosts].sort().slice(0, 15).join(', ')}${droppedHosts.size > 15 ? ', …' : ''}) — ${droppedHosts.size} host(s). Use --scope all to keep.`);
     }
@@ -1015,6 +1244,7 @@ async function main() {
         let scoped = 0;
         const before = urlResults.size + jsResults.size;
         for (const u of r.urls) {
+          if (isStaticNoise(u)) continue; // defense in depth: never output multimedia/style/font/xml
           if (!inScope(u)) {
             const h = hostnameOfUrl(u);
             if (h) droppedHosts.add(h);
@@ -1031,8 +1261,55 @@ async function main() {
   );
   await Promise.all(workers);
 
+  // sourcemap auto-unpack: every in-scope .js -> .js.map (JS-only, like unwebpack)
+  // polite by default: 2-wide, 1.5s/host gap, 429/503 backoff. --fast restores 12-wide.
+  let mapExtra = '';
+  if (args.sourcemap && !interrupted && jsResults.size > 0) {
+    const cap = args.maxMaps === 0 ? 500 : args.maxMaps;
+    const jsList = [...jsResults].sort().slice(0, cap);
+    info(`[*] Sourcemaps (${mode}): trying ${jsList.length} .js.map -> ${unpackDir}/<js>/`);
+    const taken = new Set();
+    let mapsOk = 0;
+    let filesOk = 0;
+    const foundMaps = [];
+    await mapPool(jsList, mapPoolSize, async (jsUrl) => {
+      if (interrupted) return;
+      let jsBody = null;
+      try { jsBody = await fetchText(jsUrl, args.jsTimeout); } catch { jsBody = null; }
+      const cands = mapCandidatesForJs(jsUrl, jsBody);
+      for (const mapUrl of cands) {
+        if (interrupted) return;
+        let txt = null;
+        try {
+          txt = args.fast
+            ? await fetchText(mapUrl, args.jsTimeout, MAX_SOURCEMAP_BYTES)
+            : await fetchMapText(mapUrl, args.jsTimeout);
+        } catch { txt = null; }
+        if (!txt) continue;
+        const sub = subdirForJs(jsUrl, taken);
+        const dest = path.join(unpackDir, sub);
+        const n = unpackSourcemapText(txt, dest);
+        if (n > 0) {
+          mapsOk++;
+          filesOk += n;
+          foundMaps.push(mapUrl);
+          info(`[MAP] ${short(jsUrl, 70)} -> ${short(mapUrl, 70)} (${n} files in ${sub}/)`);
+          break; // one good map per js is enough
+        }
+      }
+    });
+    for (const m of foundMaps) {
+      if (!isStaticNoise(m) && inScope(m)) urlResults.add(m);
+    }
+    if (foundMaps.length > 0) {
+      try { writeList(outUrls, urlResults); } catch { /* saveAndExit retries */ }
+    }
+    mapExtra = ` + ${mapsOk} maps/${filesOk} files (${unpackDir}/)`;
+    if (mapsOk === 0) info(`[*] Sourcemaps: no valid .map with sourcesContent found`);
+  }
+
   await browser.close().catch(() => {});
-  saveAndExit(0);
+  saveAndExit(0, mapExtra);
 }
 
 main().catch((e) => {

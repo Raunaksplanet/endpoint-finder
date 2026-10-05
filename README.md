@@ -7,7 +7,7 @@ interaction.
 
 It renders each target in real headless Chromium, runs **both** bookmarklet
 mechanisms natively, and saves complete absolute URLs split into
-`urls.txt` + `js.txt` output pairs.
+`urls.txt` + `js.txt` output pairs — plus auto-unpacked `.js.map` sources.
 
 ## How it finds endpoints
 
@@ -30,42 +30,86 @@ On top of that, the tool adds what a bookmarklet can't:
 - network-sniffed `.js` responses, inline `<script>` bodies
 - same-domain-first fetching so caps never cut your target's files for trackers
 - in-scope filtering, auto filenames, TCP preflight for dead hosts
+- **multimedia/style/font/xml filtering (always on)** — no noise in output
+- **`.js.map` auto-unpack (JS-only, no Python)** — the unwebpack goldmine built in
+- **polite rate limiting + retries** — WAF/ban safe by default
 
 ## Install
 
 Requires Node.js 18+.
 
 ```bash
-npm install
+npm install -g endpoint-finder
 npx playwright install chromium
 ```
 
 ## Usage
 
 ```bash
-node endpoint_finder.js -i subs.txt
-node endpoint_finder.js -i https://example.com/page
-node endpoint_finder.js -u https://example.com/page
-node endpoint_finder.js https://example.com/page
-cat subs.txt | node endpoint_finder.js
+endpoint-finder -i subs.txt
+endpoint-finder -i https://example.com/page
+endpoint-finder -u https://example.com/page
+endpoint-finder https://example.com/page
+cat subs.txt | endpoint-finder
 ```
 
 Single-letter flags also work without the dash (`u <url>` == `-u <url>`,
 same for `i`, `o`). A positional that matches a file on disk is read as a
-target list, so `node endpoint_finder.js subs.txt` just works.
+target list, so `endpoint-finder subs.txt` just works.
 
 ### Output files
 
-Every run writes **two** files — urls and js are never mixed:
+Every run writes **two** files — urls and js are never mixed — **never
+overwriting** (explicit `-o` is the only overwriting case):
 
 | Targets | Files |
 |---|---|
-| single target | `<domain>-urls.txt` + `<domain>-js.txt` |
+| single target | `<domain>-urls.txt` + `<domain>-js.txt` (taken → `-urls2/-js2`, `-urls3/-js3` …) |
 | several targets | `urls1.txt`+`js1.txt`, `urls2.txt`+`js2.txt`, … (first free pair, never overwrites) |
 | explicit `-o foo.txt` | `foo.txt` (urls) + `foo-js.txt` (js) |
 
 A path ending in `.js` (query ignored) goes to the js file, everything else
 to the urls file. Both files are always written, even when empty.
+
+Found `.map` URLs are added to the urls file.
+
+### Noise filter (always on)
+
+Multimedia, fonts, styles and feed noise are dropped from output —
+`--exclude-static` is kept for compat but no longer needed:
+
+- images: `png jpg jpeg gif webp bmp ico svg avif tif tiff heic heif psd ai eps cur`
+- video: `mp4 avi mov wmv flv webm mkv m4v 3gp mpg mpeg ogv m3u8 mpd ts`
+- audio: `mp3 wav ogg oga m4a aac flac wma opus mid midi`
+- fonts: `woff woff2 ttf eot otf fon pfb sfnt`
+- styles: `css scss sass less styl`
+- xml/feed: `xml xsd xsl xslt dtd rss atom`
+
+Always kept: `.pdf` + PII/sensitive (`json csv xls xlsx doc docx txt sql db
+log bak env zip`) + real endpoints + `.js` + `.map`.
+
+### Sourcemap auto-unpack (default: on)
+
+JS-only port of `unwebpack_sourcemap.py` — no Python needed. For every
+in-scope `.js` it tries `sourceMappingURL` first, then `<file.js>.map`,
+and unpacks `sources` + `sourcesContent` with traversal-safe sanitization
+(`webpack://` stripped, `../` → `parent_dir/`, `external` skipped).
+
+One subdir per unpacked map inside a single root:
+
+| Run | Unpack dir |
+|---|---|
+| single `dell.com` | `endpoint-dell.com-output/<host>__<js>/` |
+| single taken | `endpoint-dell.com-output2/`, `…3` … (never overwrites) |
+| multi `urls1` | `endpoint-scan1-output/` |
+| explicit `-o foo.txt` | `endpoint-foo-output/` |
+
+```bash
+--no-sourcemap    # disable unpack
+--max-maps <n>    # max .map per run (default 25, max 500)
+```
+
+Example (`connect.sulzer.com`): 11 js → 11 maps → 1233 files.
 
 ### Scope filter (default: `domain`)
 
@@ -91,10 +135,15 @@ output (shown only with `--verbose`).
 --max-scripts <n>        max JS files per page (default: 100, max 1000)
 --headless / --no-headless
 --no-fallback            bare hosts: try https only (default tries https then http)
---fallback               explicit https URL failing also tries the http variant
+--fallback               explicit https URL failing also tries http variant
 --strict                 exact bookmarklet quote handling (misses single-quoted paths)
 --no-inline              skip inline <script> bodies
---exclude-static         drop png/jpg/woff/mp4/… assets
+--exclude-static         (always on, kept for compat)
+--no-sourcemap           disable .js.map auto-unpack (default: enabled, JS-only)
+--max-maps <n>           max .map files to try per run (default: 25, max 500)
+--fast                   old aggressive timing (12-wide maps, 100ms gaps).
+                         Default is polite (2-wide maps, 1.5s/host gap,
+                         429/503 backoff) to avoid WAF bans
 --scope <mode>           domain (default) | host | all
 --user-agent <str>       browser + fetch User-Agent
 --verbose                retry/timeout/scope-drop logs
@@ -112,12 +161,24 @@ https://www.dell.com/en-in                                         100     470  
 nota-real-host-xyz12345.com                                     FAIL  TCP …unreachable (preflight)
 ```
 
-## Speed
+Map lines during unpack:
 
-Fully automatic — no thread flags. Parallel pages (up to 10) + a 12-wide JS
-pool, per-host rate limiting with jitter (polite, IP-ban safe), TCP
+```
+[MAP] https://…/static/js/main.abc.js -> https://…/static/js/main.abc.js.map (847 files in dell.com__static_js_main_abc/)
+[DONE] 1 targets in 46.8s -> 43 urls (…) + 11 js (…) + 11 maps/1233 files (endpoint-dell.com-output/)
+```
+
+## Speed / politeness
+
+Polite by default — no thread flags. Parallel pages (up to 10) + a 12-wide JS
+pool + a **2-wide map pool**, per-host rate limiting with jitter, TCP
 preflight so dead hosts fail in ~4s instead of 30s, shared JS cache across
-targets, and JS fetching overlapped with the page settle wait.
+targets, `429/503` + timeout retries with backoff, and JS fetching overlapped
+with the page settle wait.
+
+- page gap 800ms/host, JS gap 400ms/host, map gap 1500ms/host, jitter 400ms
+- `--fast` restores old aggressive timing (12-wide maps, 100ms gaps) for your
+  own targets
 
 Measured (30 Sep 2026, `--wait 3`):
 
@@ -125,7 +186,7 @@ Measured (30 Sep 2026, `--wait 3`):
 |---|---|---|
 | 29-target mixed list (incl. dead hosts) | ~37s | ~1900 urls + ~250 js |
 | dell.com (heavy, 100+ scripts) | ~17s | ~400 urls + js |
-| 2 light sites | ~4s | 49 urls |
+| connect.sulzer.com (12 scripts, polite) | ~47s | 43 urls + 11 js + 11 maps/1233 files |
 
 Live bot-defended pages vary run to run (rotating bundle versions, session
 beacons, captcha stubs on headless clients) — small count wobble between
