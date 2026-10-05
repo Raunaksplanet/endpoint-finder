@@ -1361,6 +1361,7 @@ async function main() {
   let saveChain = Promise.resolve();
   const checkpoint = () => {
     doneCount++;
+    if (targets.length < 10) return; // progress lines only matter on big lists
     if (doneCount % 10 === 0 || doneCount === targets.length) {
       const n = doneCount;
       saveChain = saveChain.then(() => {
@@ -1437,7 +1438,7 @@ async function main() {
   if (args.sourcemap && !interrupted && jsResults.size > 0) {
     const cap = args.maxMaps === 0 ? 500 : args.maxMaps;
     const jsList = [...jsResults].sort().slice(0, cap);
-    info(`[*] Sourcemaps (${mode}): trying ${jsList.length} .js.map -> ${unpackDir}/<js>/`);
+    info(`[*] Sourcemaps (${mode}): trying ${jsList.length} .js.map -> ${unpackDir}/`);
     const taken = new Set();
     const foundMaps = [];
     await mapPool(jsList, mapPoolSize, async (jsUrl) => {
@@ -1473,8 +1474,11 @@ async function main() {
     if (foundMaps.length > 0) {
       try { writeList(outUrls, urlResults); } catch { /* saveAndExit retries */ }
     }
-    mapExtra = ` + ${mapsOk} maps/${filesOk} files (${unpackDir}/)`;
-    if (mapsOk === 0) info(`[*] Sourcemaps: no valid .map with sourcesContent found`);
+    if (mapsOk === 0) {
+      info(`[*] Sourcemaps: no valid .map with sourcesContent found`);
+    } else {
+      mapExtra = ` + ${mapsOk} maps/${filesOk} files (${unpackDir}/)`;
+    }
   }
 
   // secrets scan (tight, JS-only): fetched JS bodies + unpacked sources -> single file
@@ -1488,7 +1492,7 @@ async function main() {
     // 1. fetched JS bodies (cached, no extra traffic) — pooled, not sequential:
     // a sequential loop here costs 400ms+ per body on same-host lists.
     const jsListAll = [...jsResults].sort();
-    info(`[*] Secrets (tight): scanning ${jsListAll.length} js bodies${mapsOk > 0 ? ' + unpacked sources' : ''} -> ${outSecrets}`);
+    info(`[*] Secrets (tight): scanning ${jsListAll.length} js bodies${mapsOk > 0 ? ' + unpacked sources' : ''}`);
     const jsBlocks = await mapPool(jsListAll, JS_POOL_SIZE, async (jsUrl) => {
       if (interrupted) return null;
       let body = null;
