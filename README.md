@@ -12,6 +12,17 @@ relative and escaped path resolution (`\/api\/x`, `\u002fapi`), LinkFinder
 quoted-string extraction, `robots.txt` rules and `sitemap.xml` (indexes
 recursed), plus opt-in depth crawling.
 
+## Webpack lazy chunks (on by default)
+
+Every fetched JS body is checked for a webpack runtime
+(`__webpack_require__.u`, old `jsonpScriptSrc`). When found, its chunk map is
+evaluated by an inert parser (no `eval`, no `new Function`, no `vm`), so lazy
+chunks the page never loads are added to the js output and fetched (80 per
+target by default) and scanned for endpoints. Handles webpack 4/5, prefix
+maps, template literals, function aliases, external maps, named chunks and
+public/CDN paths. `--no-webpack` disables it; `--max-chunks <n>` tunes the
+fetch budget (`0` = list chunks without fetching).
+
 ## Output hygiene
 
 Results are cleaned while crawling, so junk is never fetched:
@@ -87,6 +98,9 @@ timing for your own infra.
 --js-timeout <s>         per-JS fetch timeout (default: 15, min 1)
 --wait <s>               settle wait after load (default: 3, 0 ok)
 --max-scripts <n>        max JS files per page (default: 100, max 1000)
+--no-webpack             disable webpack lazy-chunk discovery (default: on)
+--max-chunks <n>         max lazy chunks fetched per target (default: 80,
+                         max 500; 0 = list chunks without fetching)
 --depth <n>              crawl depth (default 1 = seed pages only; 2+ follows
                          in-scope a/area/iframe/frame links; 0 = unlimited)
 --max-pages <n>          max extra pages crawled per target (default 25, max 500)
@@ -119,6 +133,9 @@ timing for your own infra.
   registrable domains; use `--scope all` to keep them.
 - One fetch depth past discovered files; relative `src="path/file.js"`
   without a leading slash matches bookmarklet behavior (not extracted).
+- Webpack discovery is heuristic: chunk names computed by function calls, or
+  runtimes split across files, are skipped rather than guessed. Vite,
+  Turbopack, esbuild and Parcel use different manifests.
 - Confirm target authorization yourself for engagement work.
 
 ## License

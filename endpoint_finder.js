@@ -41,6 +41,9 @@
  *   - robots.txt Allow/Disallow/Sitemap + sitemap.xml (index recursion)
  *   - opt-in depth crawl (--depth) of in-scope navigable links
  *   - ".min.js" -> ".js" sibling fetch for unminified paths
+ *   - automatic webpack lazy-chunk discovery: every fetched JS body is
+ *     checked for a runtime (.u / jsonpScriptSrc) and its chunk map is
+ *     evaluated safely (no eval) to fetch + scan chunks the page never loads
  *
  * Install:
  *   npm install
@@ -51,6 +54,7 @@ import { chromium } from 'playwright';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
+import { extractWebpackChunkUrls } from './webpack_chunks.js';
 
 // ---------------------------------------------------------------------------
 // Bookmarklet regex — native JS, exact copy
@@ -420,10 +424,10 @@ function cell(s, w) {
   return s.padEnd(w);
 }
 function tableHeader() {
-  return `${'TARGET'.padEnd(TW)} ${'SCRIPTS'.padStart(7)} ${'PATHS'.padStart(7)} ${'URLS'.padStart(7)} ${'NEW'.padStart(7)}`;
+  return `${'TARGET'.padEnd(TW)} ${'SCRIPTS'.padStart(7)} ${'CHUNKS'.padStart(7)} ${'PATHS'.padStart(7)} ${'URLS'.padStart(7)} ${'NEW'.padStart(7)}`;
 }
-function okRow(target, js, paths, urls, added) {
-  return `${cell(target, TW)} ${String(js).padStart(7)} ${String(paths).padStart(7)} ${String(urls).padStart(7)} ${(`+${added}`).padStart(7)}`;
+function okRow(target, js, chunks, paths, urls, added) {
+  return `${cell(target, TW)} ${String(js).padStart(7)} ${String(chunks).padStart(7)} ${String(paths).padStart(7)} ${String(urls).padStart(7)} ${(`+${added}`).padStart(7)}`;
 }
 function failRow(input, err) {
   let e = String(err ?? '');
@@ -1068,6 +1072,8 @@ function parseArgs(argv) {
     jsTimeout: 15,
     wait: 3,
     maxScripts: 100,
+    webpack: true,   // extract lazy webpack chunks from every fetched JS (default on)
+    maxChunks: 80,   // max lazy webpack chunks to fetch per target
     depth: 1,        // 1 = seed page only (default); 2+ = follow in-scope links
     maxPages: 25,    // hard cap on extra pages crawled per target
     robots: true,    // robots.txt Allow/Disallow/Sitemap harvesting
@@ -1117,6 +1123,8 @@ function parseArgs(argv) {
       case '--js-timeout': args.jsTimeout = Math.max(1, parseFloat(need(t)) || 15); i++; break;
       case '--wait': args.wait = parseFloat(need(t)); if (Number.isNaN(args.wait) || args.wait < 0) args.wait = 3; i++; break;
       case '--max-scripts': args.maxScripts = Math.min(1000, Math.max(0, parseInt(need(t), 10) || 0)); i++; break;
+      case '--no-webpack': args.webpack = false; i++; break;
+      case '--max-chunks': args.maxChunks = Math.min(500, Math.max(0, parseInt(need(t), 10) || 0)); i++; break;
       case '--depth': {
         const n = parseInt(need(t), 10);
         args.depth = Number.isNaN(n) ? 1 : Math.min(5, Math.max(0, n)); // 0 = unlimited (bounded by --max-pages)
@@ -1206,6 +1214,11 @@ Options:
   --js-timeout <s>         per-JS fetch timeout (default: 15)
   --wait <s>               fixed wait after load, mirrors bookmarklet setTimeout(3000) (default: 3)
   --max-scripts <n>        max JS files per page (default: 100)
+  --no-webpack             disable automatic webpack chunk discovery
+                           (default: on — every fetched JS is checked for a
+                           webpack runtime and its lazy chunks are scanned)
+  --max-chunks <n>         max lazy webpack chunks fetched per target
+                           (default: 80, max 500; 0 = list chunks only)
   --depth <n>              crawl depth: 1 = seed pages only (default),
                            2+ = follow in-scope a/area/iframe/frame links,
                            0 = unlimited (hard-capped by --max-pages)
@@ -1349,6 +1362,8 @@ async function processSingleUrl(targetUrl, browser, args) {
   const inlineSecrets = []; // tight secret hits inside inline <script> bodies (fetched JS is scanned later)
   const networkJs = new Set();
   const dropped = { media: 0, js: 0 }; // filter counters for the run summary
+  const inlineBodies = []; // inline <script> bodies (for webpack runtime discovery)
+  let wpChunks = 0;        // lazy webpack chunks fetched for this target
   let finalUrl = targetUrl;
 
   const context = await browser.newContext({
@@ -1562,6 +1577,7 @@ async function processSingleUrl(targetUrl, browser, args) {
         );
         for (const body of inlines || []) {
           if (!body) continue;
+          inlineBodies.push(body);
           harvest(body, finalUrl);
           // inline bodies are never fetched, so scan them here (small, sync, capped)
           if (args.secrets && body.length <= 500_000) {
@@ -1640,12 +1656,70 @@ async function processSingleUrl(targetUrl, browser, args) {
       minVariants.push(v);
       if (minVariants.length >= 10) break;
     }
+    let minProducts = [];
     if (minVariants.length > 0) {
-      const minProducts = await mapPool(minVariants, JS_POOL_SIZE, async (u) => ({ u, text: await fetchText(u, args.jsTimeout) }));
+      minProducts = await mapPool(minVariants, JS_POOL_SIZE, async (u) => ({ u, text: await fetchText(u, args.jsTimeout) }));
       for (const p of minProducts) {
         if (!p || !p.text) continue;
         discoveredJs.add(p.u);
         harvest(p.text, p.u);
+      }
+    }
+
+    // ---- webpack lazy-chunk discovery (default on) -------------------------
+    // Webpack apps hide most of their code in chunks the page never loads.
+    // Every fetched JS body is checked for a webpack runtime (.u / jsonpScriptSrc)
+    // and, when found, its chunk map is evaluated (safely, no eval) to list the
+    // lazy chunks. They are fetched and harvested like any other JS file.
+    if (args.webpack) {
+      const wpSeen = new Set();
+      const wpCandidates = new Set();
+      const addWpFromBody = (text) => {
+        if (!text) return;
+        let chunks;
+        try { chunks = extractWebpackChunkUrls(text); } catch { return; }
+        for (const raw of chunks) {
+          let abs;
+          try { abs = resolveAny(finalUrl, raw); } catch { continue; }
+          if (!abs) continue;
+          const c = canonicalUrl(abs);
+          if (!isJsFile(c) || wpSeen.has(c)) continue;
+          wpSeen.add(c);
+          if (isStaticNoise(c)) { dropped.media++; continue; }
+          if (args.jsFilter && isNoiseJs(c)) { dropped.js++; continue; }
+          wpCandidates.add(c);
+          discoveredJs.add(c); // listed even if the fetch is capped/out of scope
+        }
+      };
+      for (const p of allBodies) addWpFromBody(p?.text);
+      for (const p of products2) addWpFromBody(p?.text);
+      for (const p of minProducts) addWpFromBody(p?.text);
+      for (const body of inlineBodies) addWpFromBody(body);
+
+      // --max-chunks 0 = discover + list only, never fetch a chunk.
+      const wpList = args.maxChunks > 0
+        ? sameFirst([...wpCandidates].filter((u) => !fetched.has(u)
+          && (typeof args.inScope !== 'function' || args.inScope(u))))
+          .slice(0, args.maxChunks)
+        : [];
+      for (const u of wpList) fetched.add(u);
+      if (wpList.length > 0) {
+        const wpProducts = await mapPool(wpList, JS_POOL_SIZE, async (u) => ({ u, text: await fetchText(u, args.jsTimeout) }));
+        for (const p of wpProducts) {
+          if (!p || !p.text) continue;
+          harvest(p.text, p.u);
+          // one extra level: list (never fetch) runtimes found inside chunks
+          try {
+            for (const raw of extractWebpackChunkUrls(p.text)) {
+              const abs = resolveAny(finalUrl, raw);
+              if (abs && isJsFile(abs)) discoveredJs.add(canonicalUrl(abs));
+            }
+          } catch { /* not a runtime */ }
+        }
+      }
+      wpChunks = wpList.length;
+      if (args.verbose && wpChunks > 0) {
+        info(`[WP] ${short(finalUrl, 60)}: ${wpChunks} webpack chunk(s) fetched`);
       }
     }
 
@@ -1668,6 +1742,7 @@ async function processSingleUrl(targetUrl, browser, args) {
       ok: true,
       finalUrl,
       jsCount: fetched.size,
+      wpChunks,
       rawCount: rawSeen.size,
       urls: absolute,
       links: crawlLinks,
@@ -1692,6 +1767,7 @@ async function crawlDeeper(rawInput, seed, browser, args) {
     ok: true,
     finalUrl: seed.finalUrl,
     jsCount: seed.jsCount,
+    wpChunks: seed.wpChunks || 0,
     rawCount: seed.rawCount,
     urls: new Set(seed.urls),
     inlineSecrets: [...(seed.inlineSecrets || [])],
@@ -1729,6 +1805,7 @@ async function crawlDeeper(rawInput, seed, browser, args) {
     pages++;
     merged.rawCount += r.rawCount;
     merged.jsCount += r.jsCount;
+    merged.wpChunks += r.wpChunks || 0;
     merged.dropped.media += r.dropped?.media || 0;
     merged.dropped.js += r.dropped?.js || 0;
     for (const x of r.urls) merged.urls.add(x);
@@ -1873,6 +1950,7 @@ async function main() {
     ['strict', args.strict ? 'on' : 'off'],
     ['scope', args.scope],
     ['filters', `collapse ${args.collapse ? 'on' : 'off'} · js-noise ${args.jsFilter ? 'filtered' : 'kept'}`],
+    ['webpack', args.webpack ? `chunk discovery on (max ${args.maxChunks})` : 'chunk discovery off'],
     ['output', `${outUrls}\n${outJs}`],
     ['sourcemaps', args.sourcemap ? `on (max ${args.maxMaps === 0 ? 500 : args.maxMaps}) -> ${unpackDir}/` : 'off'],
     ['secrets', args.secrets ? 'on' : 'off'],
@@ -2022,7 +2100,7 @@ async function main() {
           }
         }
         added = (urlResults.size + jsResults.size) - before;
-        info(okRow(r.finalUrl, r.jsCount, r.rawCount, scoped, added));
+        info(okRow(r.finalUrl, r.jsCount, r.wpChunks || 0, r.rawCount, scoped, added));
         checkpoint();
       }
     },
