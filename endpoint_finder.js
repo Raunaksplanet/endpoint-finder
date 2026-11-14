@@ -32,6 +32,16 @@
  * bing, …) are dropped. Use --scope all to keep everything,
  * --scope host for exact-hostname matches only.
  *
+ * Crawler-grade layers added on top of the bookmarklet logic:
+ *   - DOM link graph (a/area/link/form/iframe/frame/source/embed/object,
+ *     data-href|data-url|data-src) resolved like hakrawler/colly
+ *   - relative + escaped JS paths ("api/x", "./x", "../x", "\/api\/x",
+ *     "\u002fapi\u002f") resolved with gospider's FixUrl/DecodeChars rules
+ *   - gospider LinkFinder regex for quoted relative/query/file.ext paths
+ *   - robots.txt Allow/Disallow/Sitemap + sitemap.xml (index recursion)
+ *   - opt-in depth crawl (--depth) of in-scope navigable links
+ *   - ".min.js" -> ".js" sibling fetch for unminified paths
+ *
  * Install:
  *   npm install
  *   npx playwright install chromium
@@ -78,7 +88,7 @@ function extractJsUrls(text) {
   JS_URL_RE.lastIndex = 0;
   for (const m of text.matchAll(JS_URL_RE)) {
     try {
-      const parsed = new URL(m[0]);
+      const parsed = new URL(collapseDuplicateQuery(m[0]));
       if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') continue;
       out.add(parsed.href);
     } catch { /* malformed — skip */ }
@@ -112,9 +122,119 @@ const STATIC_EXTS = new Set([
 ]);
 
 function cleanToken(tok) {
-  const s = (tok ?? '').trim().replace(/^['"`,;]+|['"`,;]+$/g, '');
+  let s = (tok ?? '').trim().replace(/^['"`,;]+|['"`,;]+$/g, '');
+  // JSON/JS escaping leaves trailing backslashes on tokens: "#org\" / "#org\\\"
+  s = s.replace(/\\+$/, '');
   if (!s || s.startsWith('#')) return null;
-  return s;
+  return collapseDuplicateQuery(s);
+}
+
+/** "...x.js?dpl=A?dpl=A" -> "...x.js?dpl=A" (same query pasted twice). */
+function collapseDuplicateQuery(s) {
+  return s.replace(/(\?[^?#]+)\1$/, '$1');
+}
+
+/**
+ * Canonical output form:
+ *   - fragments dropped (a page#anchor is the same endpoint; #org JSON-LD ids
+ *     are not endpoints at all)
+ *   - trailing slash after a file extension dropped ("/chunk.js/" -> "/chunk.js")
+ *   - "///" collapsed to "/"
+ */
+function canonicalUrl(absUrl) {
+  try {
+    const u = new URL(collapseDuplicateQuery(String(absUrl).trim()));
+    if (u.hash) u.hash = '';
+    u.pathname = u.pathname.replace(/(\/[^/]+\.[a-z0-9]{1,8})\/+$/i, '$1');
+    if (u.pathname.length > 1 && /^\/+$/.test(u.pathname)) u.pathname = '/';
+    return u.href;
+  } catch {
+    return String(absUrl).trim();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pattern collapse: repeated endpoints that only differ by an id/hash.
+//   /user/8f3c...-uuid      -> /user/{uuid}
+//   /media/....c8f64370.jpg -> /media/....{hex}.jpg
+//   /blog/12345             -> /blog/{num}
+// Keeps the first URL per pattern so output stays readable without losing
+// the endpoint shape.
+// ---------------------------------------------------------------------------
+const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+const HEX_RE = /\b[0-9a-f]{8,}\b/gi; // only 8+ hex runs; chunk names with g-z survive
+// whole numeric path segments only (/ticket/12345/view), so date slugs like
+// /2023-03-30_report.php are not merged together
+const NUM_RE = /(?<=\/)\d{4,}(?=[/?#]|$)/g;
+
+function patternKey(absUrl) {
+  const mask = (s) => s.replace(UUID_RE, '{uuid}').replace(HEX_RE, '{hex}').replace(NUM_RE, '{num}');
+  try {
+    const u = new URL(absUrl);
+    let p = u.pathname.replace(/\/+$/, '');
+    if (!p) p = '/';
+    // never mask the host: hex-looking subdomains must stay distinct targets
+    return `${u.protocol}//${u.host}${mask(p)}${mask(u.search)}`;
+  } catch {
+    return mask(absUrl);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// JS noise: tag managers, analytics, consent widgets, a11y checkers, PWA
+// boilerplate. These never contain app endpoints and are skipped entirely
+// (also means we don't spend requests fetching them).
+// ---------------------------------------------------------------------------
+const NOISE_JS_NAME_RE = /^(?:gtm|gtag|ga|analytics|fbevents|hotjar|clarity|matomo|piwik|waichecker|cookiebot|onetrust|consent|polyfill|modernizr|service-worker|sw)(?:[.\-_]|$)/i;
+const NOISE_JS_PATH_SUBSTR = [
+  '/google-analytics/',
+  '/google-tag-manager/',
+  '/gtag/',
+  '/gtm/',
+  '/_vercel/insights/',
+  '/wp-content/plugins/google-analytics',
+];
+
+function isNoiseJs(absUrl) {
+  try {
+    const p = new URL(absUrl).pathname.toLowerCase();
+    if (NOISE_JS_PATH_SUBSTR.some((x) => p.includes(x))) return true;
+    const base = p.split('/').pop() || '';
+    return NOISE_JS_NAME_RE.test(base);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve a relative token (api/v1/x, ./x, ../x) against the file it was found
+ * in. Adds an overlap merge so a token like "static/immutable/chunks/x.js"
+ * found inside ".../static/immutable/chunks/abc.js" doesn't produce
+ * ".../chunks/static/immutable/chunks/x.js".
+ */
+function resolveRelative(baseUrl, raw) {
+  const s = cleanToken(raw);
+  if (!s) return null;
+  if (/^(?:[a-z][a-z0-9+.-]*:|\/)/i.test(s) || /^[?#]/.test(s) || s.startsWith('.')) {
+    return resolveAny(baseUrl, s);
+  }
+  const abs = resolveAny(baseUrl, s);
+  if (!abs) return null;
+  try {
+    const b = new URL(baseUrl);
+    const segs = b.pathname.split('/').filter(Boolean);
+    const dirSegs = b.pathname.endsWith('/') ? segs : segs.slice(0, -1);
+    const tokSegs = s.split(/[?#]/)[0].split('/').filter(Boolean);
+    const maxK = Math.min(dirSegs.length, tokSegs.length);
+    for (let k = maxK; k >= 2; k--) {
+      if (dirSegs.slice(dirSegs.length - k).join('/') === tokSegs.slice(0, k).join('/')) {
+        const u = new URL(abs);
+        u.pathname = `/${[...dirSegs, ...tokSegs.slice(k)].join('/')}`;
+        return u.href;
+      }
+    }
+  } catch { /* fall back to standard resolution */ }
+  return abs;
 }
 
 function splitMaybeMulti(line) {
@@ -155,14 +275,28 @@ function shouldSkipScriptSrc(src) {
   return SKIP_SCHEMES.some((p) => low.startsWith(p));
 }
 
-function resolveToAbsolute(basePageUrl, rawPath) {
-  if (!rawPath || !rawPath.startsWith('/') || rawPath.length <= 1) return null;
+/**
+ * Resolve ANY candidate (bookmarklet path, gospider/hakrawler-style token,
+ * DOM attribute) against the URL it was found on.
+ * Ported from gospider's FixUrl (url.ResolveReference semantics):
+ *   "/x", "./x", "../x", "api/x", "?q=1", "//host/x", "https://host/x"
+ * all become absolute. Only http(s) survives.
+ */
+function resolveAny(basePageUrl, raw) {
+  const s = cleanToken(raw);
+  if (!s || s.length > 4096) return null;
+  const low = s.toLowerCase();
+  if (SKIP_SCHEMES.some((p) => low.startsWith(p))) return null;
+  if (s.startsWith('#')) return null;
   try {
-    if (rawPath.startsWith('//')) {
+    if (s.startsWith('//')) {
       const scheme = new URL(basePageUrl).protocol || 'https:';
-      return `${scheme}${rawPath}`;
+      const u = new URL(`${scheme}${s}`);
+      return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : null;
     }
-    const abs = new URL(rawPath, basePageUrl).href;
+    // reject non-http(s) schemes (ftp:, file:, chrome-extension: …) early
+    if (/^[a-z][a-z0-9+.-]*:/i.test(s) && !/^https?:/i.test(s)) return null;
+    const abs = new URL(s, basePageUrl).href;
     const u = new URL(abs);
     if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
     if (!u.host) return null;
@@ -172,12 +306,80 @@ function resolveToAbsolute(basePageUrl, rawPath) {
   }
 }
 
+/**
+ * Decode the escapes that hide paths inside JS/JSON bodies.
+ * Port of gospider's DecodeChars (targeted: no URL-unescape pass, which would
+ * turn "+" into spaces and corrupt query strings):
+ *   "\/api\/v1" -> "/api/v1"
+ *   "\u002fapi\u002f" -> "/api/"
+ *   "\x2fapi\x2f" -> "/api/"
+ */
+function decodeEscapes(text) {
+  if (!text || !text.includes('\\')) return text;
+  return text
+    .replace(/\\u002[fF]/g, '/')
+    .replace(/\\u0026/g, '&')
+    .replace(/\\u003[dD]/g, '=')
+    .replace(/\\u003[fF]/g, '?')
+    .replace(/\\u0023/g, '#')
+    .replace(/\\x2[fF]/g, '/')
+    .replace(/\\\//g, '/');
+}
+
+// MIME tokens the richer extractor would otherwise mistake for paths
+// ("text/html", "application/json", … are quoted constants, not endpoints).
+const MIME_TOKEN_RE = /^(?:text|application|image|audio|video|font|multipart|message|model|example)\/[a-z0-9.+-]+(?:\s*;.*)?$/i;
+
+/**
+ * gospider's LinkFinder regex, ported to JS. Catches what the bookmarklet
+ * regex cannot: schemeless "//host/x", relative "./x", "../x", "api/v1/x",
+ * query-bearing paths and file.ext endpoints inside quoted JS/JSON strings.
+ */
+// biome-ignore lint: intentional port of gospider/core/linkfinder.go
+const LINKFINDER_RE = /(?:"|')(((?:[a-zA-Z]{1,10}:\/\/|\/\/)[^"'/]{1,}\.[a-zA-Z]{2,}[^"']{0,})|((?:\/|\.\.\/|\.\/)[^"'><,;| *()%$^/\\[\]]{1,}[^"'><,;|()\s]{1,})|([a-zA-Z0-9_\-/]{1,}\/[a-zA-Z0-9_\-/]{1,}\.(?:[a-zA-Z]{1,4}|action)(?:[?#][^"'\s]{0,}|))|([a-zA-Z0-9_\-/]{1,}\/[a-zA-Z0-9_\-/]{3,}(?:[?#][^"'\s]{0,}|))|([a-zA-Z0-9_\-]{1,}\.(?:php|asp|aspx|jsp|json|action|html|js|txt|xml)(?:[?#][^"'\s]{0,}|)))(?:"|')/g;
+
+function extractLinkfinder(text) {
+  const out = new Set();
+  if (!text || text.length < 4) return out;
+  const sample = text.length > 4_000_000 ? text.slice(0, 4_000_000) : text;
+  LINKFINDER_RE.lastIndex = 0;
+  let m;
+  while ((m = LINKFINDER_RE.exec(sample)) !== null) {
+    const tok = cleanToken(m[1]);
+    if (tok && tok.length >= 3 && tok.length <= 2048 && !/\s/.test(tok) && !MIME_TOKEN_RE.test(tok)) {
+      const hasScheme = /^(?:https?:)?\/\//i.test(tok);
+      const startsPath = /^(?:\/|\.{1,2}\/)/.test(tok);
+      const seg = tok.split(/[?#]/)[0];
+      const last = seg.split('/').pop() || '';
+      const hasExt = /\.[a-z0-9]{1,5}$/i.test(last);
+      const slashes = (tok.match(/\//g) || []).length;
+      // git-token noise guard: bare "and/or"/"n/a" is not an endpoint
+      if (hasScheme || startsPath || hasExt || slashes >= 2) out.add(tok);
+    }
+    if (m[0].length === 0) LINKFINDER_RE.lastIndex++;
+  }
+  return out;
+}
+
 function isStaticNoise(absUrl) {
   try {
-    const p = new URL(absUrl).pathname.toLowerCase();
+    const u = new URL(absUrl);
+    // trailing slashes are extraction artifacts on files: "/app.js/" -> "/app.js"
+    const p = u.pathname.toLowerCase().replace(/\/+$/, '') || '/';
     for (const ext of STATIC_EXTS) {
       if (p.endsWith(ext)) return true;
     }
+    const full = `${u.pathname}${u.search}`;
+    // srcset / responsive-image tokens: "img.jpg 383w, /img2.jpg 766w"
+    // (encoded spaces or literal commas joining multiple candidates)
+    if (/%20|%09/i.test(full)) return true;
+    let decoded = full;
+    try { decoded = decodeURIComponent(full); } catch { /* malformed % */ }
+    if (/\.(?:jpe?g|png|gif|webp|avif|svg|ico|bmp|tiff?|css)(?:[^a-z0-9]|$)/i.test(decoded)) return true;
+    // image optimizer endpoints (/ _next/image?url=...webp) and thumbnails
+    if (/\/wthumbnails\//i.test(p)) return true;
+    // punctuation-only paths ("/&", "///") carry no endpoint
+    if (p !== '/' && !/[a-z0-9]/i.test(p) && !u.search) return true;
   } catch { /* ignore */ }
   return false;
 }
@@ -185,6 +387,29 @@ function isStaticNoise(absUrl) {
 /** Normal logs (suppressed with -q/--quiet). FAIL + DONE always print. */
 function info(...a) {
   if (!globalThis.__QUIET) console.log(...a);
+}
+
+/**
+ * Aligned label/value block for the run banner and final summary.
+ * One setting per line instead of a single wall of "a | b | c".
+ * Multi-line values are indented under the same label column.
+ */
+function labelBlock(rows, indent = 2) {
+  const w = Math.max(...rows.map(([k]) => String(k).length));
+  const pad = ' '.repeat(indent);
+  const lines = [];
+  for (const [k, v] of rows) {
+    if (v == null || v === '') continue;
+    const vals = String(v).split('\n');
+    lines.push(`${pad}${String(k).padEnd(w)}  ${vals[0]}`);
+    for (const more of vals.slice(1)) lines.push(`${pad}${' '.repeat(w)}  ${more}`);
+  }
+  return lines.join('\n');
+}
+
+/** "1 host" / "3 hosts" without a dependency. */
+function plural(n, word) {
+  return `${n} ${word}${n === 1 ? '' : 's'}`;
 }
 
 // Result table (no borders, aligned spacing)
@@ -268,7 +493,10 @@ function targetHostname(raw) {
 }
 
 function sanitizeFilename(s) {
-  return (s || '').toLowerCase().replace(/[^a-z0-9.\-]+/g, '_');
+  // never let a bad host/target produce hidden or empty output names
+  // (e.g. host "." -> "target-urls.txt", not ".-urls.txt")
+  const out = (s || '').toLowerCase().replace(/[^a-z0-9.\-]+/g, '_').replace(/^[.\-]+/, '');
+  return out || 'target';
 }
 
 /** Default output pair for one target: <host>-urls.txt + <host>-js.txt */
@@ -339,10 +567,11 @@ function deriveUnpackDir(outUrls, targets, outputExplicit) {
   return `${full}${n}`;
 }
 
-/** True if the URL points to a JS file (path ends .js, query ignored). */
+/** True if the URL points to a JS file (path ends .js, query/trailing slash ignored). */
 function isJsFile(absUrl) {
   try {
-    return new URL(absUrl).pathname.toLowerCase().endsWith('.js');
+    const p = new URL(absUrl).pathname.toLowerCase().replace(/\/+$/, '');
+    return p.endsWith('.js') || p.endsWith('.mjs');
   } catch {
     return false;
   }
@@ -709,6 +938,92 @@ async function fetchMapText(url, timeoutSec, maxBytes = MAX_SOURCEMAP_BYTES) {
   return text;
 }
 
+// ---------------------------------------------------------------------------
+// robots.txt + sitemap.xml harvesting (logic ported from gospider:
+// core/robots.go and core/sitemap.go). Cheap same-origin discovery that
+// browsers/regex-only scanners never see.
+// ---------------------------------------------------------------------------
+const siteThrottle = new HostThrottle();
+
+async function fetchSiteFile(url, timeoutSec, maxBytes = 4_000_000) {
+  await siteThrottle.acquire(hostnameOfUrl(url), PAGE_GAP_MS);
+  return fetchTextRetry(url, timeoutSec, maxBytes, 1);
+}
+
+/** robots.txt -> Allow/Disallow paths + Sitemap: declarations. */
+async function fetchRobots(origin, timeoutSec) {
+  const urls = new Set();
+  const sitemaps = [];
+  let text = null;
+  try { text = await fetchSiteFile(`${origin}/robots.txt`, timeoutSec, 1_000_000); } catch { text = null; }
+  if (!text) return { urls, sitemaps };
+  for (const line of text.split(/\r?\n/)) {
+    const sm = line.match(/^\s*Sitemap\s*:\s*(\S+)/i);
+    if (sm) {
+      if (/^https?:\/\//i.test(sm[1])) sitemaps.push(sm[1]);
+      continue;
+    }
+    const m = line.match(/^\s*(Allow|Disallow)\s*:\s*(.*?)\s*$/i);
+    if (!m) continue;
+    let p = m[2].trim();
+    if (!p) continue;
+    if (p === '/') { urls.add(`${origin}/`); continue; }
+    if (p.includes('*') || p.includes('$')) p = p.split(/[*$]/)[0]; // wildcard rule -> literal prefix
+    if (!p || p === '/') continue;
+    if (p.startsWith('/')) urls.add(`${origin}${p}`);
+    else if (/^https?:\/\//i.test(p)) urls.add(p);
+  }
+  return { urls, sitemaps };
+}
+
+const SITEMAP_PATHS = ['/sitemap.xml', '/sitemap_index.xml', '/sitemap-index.xml', '/sitemap1.xml', '/sitemap.txt'];
+
+/** sitemap.xml (+ indexes, + robots-declared sitemaps) -> page URLs. */
+async function fetchSitemap(origin, timeoutSec, seeds = [], maxFetches = 6, maxUrls = 2000) {
+  const out = new Set();
+  const queue = [...seeds, ...SITEMAP_PATHS.map((p) => `${origin}${p}`)];
+  const seen = new Set();
+  let fetches = 0;
+  while (queue.length > 0 && fetches < maxFetches && out.size < maxUrls) {
+    const u = queue.shift();
+    if (!u || seen.has(u) || /\.gz(?:$|\?)/i.test(u)) continue; // gz needs zlib; skip politely
+    seen.add(u);
+    fetches++;
+    let text = null;
+    try { text = await fetchSiteFile(u, timeoutSec, 4_000_000); } catch { text = null; }
+    if (!text) continue;
+    if (!/<loc[\s>]/i.test(text)) {
+      // plain-text sitemap: one absolute URL per line
+      for (const line of text.split(/\r?\n/)) {
+        const s = line.trim();
+        if (/^https?:\/\/\S+$/i.test(s)) out.add(s);
+        if (out.size >= maxUrls) break;
+      }
+      continue;
+    }
+    for (const m of text.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)) {
+      const loc = m[1].replace(/&amp;/g, '&').trim();
+      if (!/^https?:\/\//i.test(loc)) continue;
+      if (/sitemap/i.test(loc) && /\.xml(?:$|\?)/i.test(loc)) {
+        if (queue.length < 50) queue.push(loc); // sitemap index -> recurse (capped)
+        continue;
+      }
+      out.add(loc);
+      if (out.size >= maxUrls) break;
+    }
+  }
+  return out;
+}
+
+function originOf(raw) {
+  try {
+    const first = candidateUrls(raw)[0];
+    return first ? new URL(first).origin : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Fast TCP preflight: unreachable hosts fail in ~PREFLIGHT_MS instead of the
  *  full 30s browser timeout. Returns true if host:port accepts a connection. */
 function tcpReachable(host, port, timeoutMs = PREFLIGHT_MS) {
@@ -753,6 +1068,12 @@ function parseArgs(argv) {
     jsTimeout: 15,
     wait: 3,
     maxScripts: 100,
+    depth: 1,        // 1 = seed page only (default); 2+ = follow in-scope links
+    maxPages: 25,    // hard cap on extra pages crawled per target
+    robots: true,    // robots.txt Allow/Disallow/Sitemap harvesting
+    sitemap: true,   // sitemap.xml harvesting (incl. sitemap indexes)
+    collapse: true,  // collapse uuid/hex/numeric-id URL patterns to one entry
+    jsFilter: true,  // drop gtm/analytics/a11y/PWA-boilerplate JS entirely
     headless: true,
     noFallback: false,
     fallback: false,
@@ -796,6 +1117,16 @@ function parseArgs(argv) {
       case '--js-timeout': args.jsTimeout = Math.max(1, parseFloat(need(t)) || 15); i++; break;
       case '--wait': args.wait = parseFloat(need(t)); if (Number.isNaN(args.wait) || args.wait < 0) args.wait = 3; i++; break;
       case '--max-scripts': args.maxScripts = Math.min(1000, Math.max(0, parseInt(need(t), 10) || 0)); i++; break;
+      case '--depth': {
+        const n = parseInt(need(t), 10);
+        args.depth = Number.isNaN(n) ? 1 : Math.min(5, Math.max(0, n)); // 0 = unlimited (bounded by --max-pages)
+        i++; break;
+      }
+      case '--max-pages': args.maxPages = Math.min(500, Math.max(1, parseInt(need(t), 10) || 25)); i++; break;
+      case '--no-robots': args.robots = false; i++; break;
+      case '--no-sitemap': args.sitemap = false; i++; break;
+      case '--no-collapse': args.collapse = false; i++; break;
+      case '--no-js-filter': args.jsFilter = false; i++; break;
       case '--headless': args.headless = true; i++; break;
       case '--no-headless': args.headless = false; i++; break;
       case '--no-fallback': args.noFallback = true; i++; break;
@@ -875,6 +1206,17 @@ Options:
   --js-timeout <s>         per-JS fetch timeout (default: 15)
   --wait <s>               fixed wait after load, mirrors bookmarklet setTimeout(3000) (default: 3)
   --max-scripts <n>        max JS files per page (default: 100)
+  --depth <n>              crawl depth: 1 = seed pages only (default),
+                           2+ = follow in-scope a/area/iframe/frame links,
+                           0 = unlimited (hard-capped by --max-pages)
+  --max-pages <n>          max extra pages crawled per target with --depth
+                           (default: 25, max 500)
+  --no-robots              skip robots.txt Allow/Disallow/Sitemap harvesting
+  --no-sitemap             skip sitemap.xml harvesting (incl. sitemap indexes)
+  --no-collapse            keep every uuid/hex/numeric-id URL variant
+                           (default: collapse to one per pattern)
+  --no-js-filter           keep noise JS (gtm, analytics, consent, waiChecker, sw)
+                           (default: dropped before fetching)
   --headless / --no-headless
   --no-fallback            bare hosts: try https only (default tries https then http)
   --fallback               explicit https URL failing also tries http variant
@@ -1002,11 +1344,11 @@ async function loadTargets(args) {
 // Per-target worker
 // ---------------------------------------------------------------------------
 async function processSingleUrl(targetUrl, browser, args) {
-  const foundRaw = new Set();
   const scriptSrcs = new Set();
   const discoveredJs = new Set(); // absolute .js URLs found in text (2nd bookmarklet)
   const inlineSecrets = []; // tight secret hits inside inline <script> bodies (fetched JS is scanned later)
   const networkJs = new Set();
+  const dropped = { media: 0, js: 0 }; // filter counters for the run summary
   let finalUrl = targetUrl;
 
   const context = await browser.newContext({
@@ -1078,15 +1420,23 @@ async function processSingleUrl(targetUrl, browser, args) {
 
     // EARLY pass: fetch known scripts in the BACKGROUND while the page
     // settles below — the fixed wait is no longer idle time.
-    for (const u of await collectTagSrcs()) scriptSrcs.add(u);
-    for (const u of networkJs) {
-      try {
-        scriptSrcs.add(new URL(u, finalUrl).href);
-      } catch { /* ignore */ }
-    }
+    // addScript drops noise JS (gtm/analytics/consent/a11y) before it is
+    // queued, so we never spend a request on files with no endpoints.
+    const addScript = (u) => {
+      if (!u) return;
+      let c;
+      try { c = canonicalUrl(new URL(u, finalUrl).href); } catch { return; }
+      if (scriptSrcs.has(c)) return;
+      if (isStaticNoise(c)) { dropped.media++; return; }
+      if (args.jsFilter && isNoiseJs(c)) { dropped.js++; return; }
+      scriptSrcs.add(c);
+      discoveredJs.add(c);
+    };
+    for (const u of await collectTagSrcs()) addScript(u);
+    for (const u of networkJs) addScript(u);
     const earlyList = sameFirst(scriptSrcs).slice(0, args.maxScripts);
     const fetched = new Set(earlyList);
-    const bgProducts = mapPool(earlyList, JS_POOL_SIZE, (u) => fetchText(u, args.jsTimeout));
+    const bgProducts = mapPool(earlyList, JS_POOL_SIZE, async (u) => ({ u, text: await fetchText(u, args.jsTimeout) }));
 
     try {
       await page.waitForLoadState('networkidle', { timeout: 2500 });
@@ -1098,21 +1448,111 @@ async function processSingleUrl(targetUrl, browser, args) {
     } catch { /* keep finalUrl */ }
 
     // LATE pass: scripts injected during load + full page content
-    for (const u of await collectTagSrcs()) scriptSrcs.add(u);
-    for (const u of networkJs) {
+    for (const u of await collectTagSrcs()) addScript(u);
+    for (const u of networkJs) addScript(u);
+
+    // ---- extraction core (base-aware: relative paths resolve against the
+    // document/script they were found in — gospider's FixUrl semantics) ----
+    const absolute = new Set();
+    const crawlLinks = new Set();
+    const rawSeen = new Set();
+
+    const addCand = (raw, base) => {
+      const s = cleanToken(raw);
+      if (!s) return;
+      // absolute paths ("/x", "//host/x") are browser-resolved against the
+      // page (bookmarklet semantics); relative tokens are resolved against
+      // the file they appear in (gospider semantics, e.g. "./chunks/x.js"),
+      // with an overlap merge so ".../chunks/x.js" tokens don't double paths.
+      const absPath = s.startsWith('/');
+      const abs = absPath ? resolveAny(finalUrl, s) : resolveRelative(base || finalUrl, s);
+      if (!abs) return;
+      const c = canonicalUrl(abs);
+      if (absolute.has(c)) return;
+      if (isStaticNoise(c)) { dropped.media++; return; }
+      if (isJsFile(c)) {
+        if (args.jsFilter && isNoiseJs(c)) { dropped.js++; return; }
+        scriptSrcs.add(c);
+        discoveredJs.add(c);
+      }
+      absolute.add(c);
+    };
+
+    const harvest = (text, base) => {
+      if (!text) return;
+      // 1. bookmarklet regex (exact original mechanism)
+      for (const p of extractPaths(text, args.strict)) {
+        if (!p) continue;
+        rawSeen.add(p);
+        addCand(p, base);
+      }
+      // 2. escaped paths: "\/api\/x", "\u002fapi\u002f" (gospider DecodeChars)
+      const dec = decodeEscapes(text);
+      if (dec !== text) {
+        for (const p of extractPaths(dec, args.strict)) {
+          if (!p) continue;
+          rawSeen.add(p);
+          addCand(p, base);
+        }
+      }
+      // 3. gospider LinkFinder: relative ./ ../ api/v1/x, query paths, file.ext
+      for (const t of extractLinkfinder(text)) {
+        rawSeen.add(t);
+        addCand(t, base); // NOTE: endpoints only — never crawl seeds
+      }
+      // 4. absolute .js URLs (2nd bookmarklet)
+      for (const u of extractJsUrls(text)) addScript(u);
+    };
+
+    // DOM link graph == hakrawler's a[href]/script[src]/form[action] handlers,
+    // plus iframes/frames/preloads/uploads/embeds the regex can't see.
+    // `follow` marks navigable documents (a/area/iframe/frame) for --depth;
+    // form actions, manifests and data-* URLs are endpoints, not crawl seeds.
+    const collectDomLinks = async () => {
+      const out = [];
       try {
-        scriptSrcs.add(new URL(u, finalUrl).href);
-      } catch { /* ignore */ }
-    }
+        const vals = await page.$$eval(
+          'a[href], area[href], link[href], form[action], iframe[src], frame[src], source[src], video[src], audio[src], embed[src], object[data], input[formaction], button[formaction], [data-href], [data-url], [data-src]',
+          (els) => els.slice(0, 5000).map((e) => {
+            const follow = /^(A|AREA|IFRAME|FRAME)$/.test(e.tagName);
+            for (const a of ['href', 'src', 'action', 'data', 'formaction', 'data-href', 'data-url', 'data-src']) {
+              const v = e.getAttribute(a);
+              if (v && v.trim()) return { v: v.trim(), follow };
+            }
+            return null;
+          }),
+        );
+        for (const item of vals || []) {
+          if (!item || !item.v || item.v.startsWith('#')) continue;
+          if (shouldSkipScriptSrc(item.v)) continue;
+          out.push(item);
+        }
+      } catch { /* no DOM yet */ }
+      return out;
+    };
+
+    const ingestDomLinks = async () => {
+      for (const { v, follow } of await collectDomLinks()) {
+        const abs = resolveAny(finalUrl, v);
+        if (!abs) continue;
+        const c = canonicalUrl(abs);
+        if (absolute.has(c)) continue;
+        if (isStaticNoise(c)) { dropped.media++; continue; }
+        if (isJsFile(c)) {
+          if (args.jsFilter && isNoiseJs(c)) { dropped.js++; continue; }
+          scriptSrcs.add(c);
+          discoveredJs.add(c);
+        } else if (follow) {
+          crawlLinks.add(c);
+        }
+        absolute.add(c);
+      }
+    };
+    await ingestDomLinks();
 
     // page HTML == document.documentElement.outerHTML
     try {
-      const html = await page.content();
-      for (const p of extractPaths(html, args.strict)) foundRaw.add(p);
-      for (const u of extractJsUrls(html)) {
-        scriptSrcs.add(u);
-        discoveredJs.add(u);
-      }
+      harvest(await page.content(), finalUrl);
     } catch { /* ignore */ }
 
     if (!args.noInline) {
@@ -1122,11 +1562,7 @@ async function processSingleUrl(targetUrl, browser, args) {
         );
         for (const body of inlines || []) {
           if (!body) continue;
-          for (const p of extractPaths(body, args.strict)) foundRaw.add(p);
-          for (const u of extractJsUrls(body)) {
-            scriptSrcs.add(u);
-            discoveredJs.add(u);
-          }
+          harvest(body, finalUrl);
           // inline bodies are never fetched, so scan them here (small, sync, capped)
           if (args.secrets && body.length <= 500_000) {
             let hits;
@@ -1150,58 +1586,167 @@ async function processSingleUrl(targetUrl, browser, args) {
     const restList = sameFirst([...scriptSrcs].filter((u) => !fetched.has(u)))
       .slice(0, Math.max(0, args.maxScripts - earlyList.length));
     for (const u of restList) fetched.add(u);
-    const restProducts = mapPool(restList, JS_POOL_SIZE, (u) => fetchText(u, args.jsTimeout));
+    const restProducts = mapPool(restList, JS_POOL_SIZE, async (u) => ({ u, text: await fetchText(u, args.jsTimeout) }));
 
     const allBodies = [...(await bgProducts), ...(await restProducts)];
+    for (const p of allBodies) {
+      if (!p || !p.text) continue;
+      harvest(p.text, p.u); // relative paths resolve against the JS file, not the page
+    }
 
     // round 2: absolute .js URLs discovered inside round-1 bodies —
     // files the page references but never loads (2nd bookmarklet's trick)
     const round2 = [];
-    for (const txt of allBodies) {
-      if (!txt) continue;
-      for (const p of extractPaths(txt, args.strict)) foundRaw.add(p);
-      for (const u of extractJsUrls(txt)) {
+    for (const p of allBodies) {
+      if (!p || !p.text) continue;
+      for (const u0 of extractJsUrls(p.text)) {
+        const u = canonicalUrl(u0);
+        if (isStaticNoise(u)) { dropped.media++; continue; }
+        if (args.jsFilter && isNoiseJs(u)) { dropped.js++; continue; }
         discoveredJs.add(u);
         if (!fetched.has(u)) {
           fetched.add(u);
           round2.push(u);
         }
       }
+      // linkfinder also surfaces .js files in relative/escaped form
+      for (const t of extractLinkfinder(p.text)) {
+        const abs = resolveRelative(p.u, t);
+        if (!abs) continue;
+        const c = canonicalUrl(abs);
+        if (!isJsFile(c) || fetched.has(c)) continue;
+        if (isStaticNoise(c)) { dropped.media++; continue; }
+        if (args.jsFilter && isNoiseJs(c)) { dropped.js++; continue; }
+        fetched.add(c);
+        round2.push(c);
+      }
     }
     const jsList2 = sameFirst(round2).slice(0, JS_DISCOVERY_EXTRA);
-    const products2 = await mapPool(jsList2, JS_POOL_SIZE, (u) => fetchText(u, args.jsTimeout));
-    for (const txt of products2) {
-      if (!txt) continue;
-      for (const p of extractPaths(txt, args.strict)) foundRaw.add(p);
-      for (const u of extractJsUrls(txt)) discoveredJs.add(u); // listed, not fetched (depth cap)
+    const products2 = await mapPool(jsList2, JS_POOL_SIZE, async (u) => ({ u, text: await fetchText(u, args.jsTimeout) }));
+    for (const p of products2) {
+      if (!p || !p.text) continue;
+      harvest(p.text, p.u);
+    }
+
+    // gospider trick: ".min.js" usually ships next to a readable ".js";
+    // fetch the unminified sibling for paths the minified build hides.
+    const minVariants = [];
+    for (const u of [...fetched]) {
+      if (!/\.min\.js(?:[?#]|$)/i.test(u)) continue;
+      const v = u.replace(/\.min\.js/i, '.js');
+      if (fetched.has(v) || isStaticNoise(v)) continue;
+      if (args.jsFilter && isNoiseJs(v)) continue;
+      fetched.add(v);
+      minVariants.push(v);
+      if (minVariants.length >= 10) break;
+    }
+    if (minVariants.length > 0) {
+      const minProducts = await mapPool(minVariants, JS_POOL_SIZE, async (u) => ({ u, text: await fetchText(u, args.jsTimeout) }));
+      for (const p of minProducts) {
+        if (!p || !p.text) continue;
+        discoveredJs.add(p.u);
+        harvest(p.text, p.u);
+      }
     }
 
     // late-injected DOM: bot sensors/beacons write links after load —
     // re-read the page once (~free) so they aren't missed.
     try {
-      const html2 = await page.content();
-      for (const p of extractPaths(html2, args.strict)) foundRaw.add(p);
-      for (const u of extractJsUrls(html2)) discoveredJs.add(u);
+      harvest(await page.content(), finalUrl);
+      await ingestDomLinks();
     } catch { /* ignore */ }
 
-    const absolute = new Set();
-    for (const rawPath of foundRaw) {
-      const abs = resolveToAbsolute(finalUrl, rawPath);
-      if (!abs) continue;
-      if (isStaticNoise(abs)) continue; // always-on: multimedia/style/font/xml filtered, pdf+PII kept
-      absolute.add(abs);
-    }
     // discovered absolute .js files are endpoints too (scope-filtered downstream)
-    for (const u of discoveredJs) {
-      if (isStaticNoise(u)) continue; // same always-on filter (defense in depth)
+    for (const u0 of discoveredJs) {
+      const u = canonicalUrl(u0);
+      if (isStaticNoise(u)) { dropped.media++; continue; } // same always-on filter (defense in depth)
+      if (args.jsFilter && isJsFile(u) && isNoiseJs(u)) { dropped.js++; continue; }
       absolute.add(u);
     }
 
-    return { ok: true, finalUrl, jsCount: earlyList.length + restList.length + jsList2.length, rawCount: foundRaw.size, urls: absolute, inlineSecrets };
+    return {
+      ok: true,
+      finalUrl,
+      jsCount: fetched.size,
+      rawCount: rawSeen.size,
+      urls: absolute,
+      links: crawlLinks,
+      inlineSecrets,
+      dropped,
+    };
   } finally {
     try { await page.close(); } catch { /* ignore */ }
     try { await context.close(); } catch { /* ignore */ }
   }
+}
+
+/**
+ * Depth-limited crawl of in-scope links found on the seed page.
+ * Ported from hakrawler's colly MaxDepth loop / gospider's depth flag.
+ * Opt-in via --depth 2+. Sequential per target on purpose: the per-host
+ * throttle already spaces requests, and this avoids a burst on one site.
+ */
+async function crawlDeeper(rawInput, seed, browser, args) {
+  const merged = {
+    input: rawInput,
+    ok: true,
+    finalUrl: seed.finalUrl,
+    jsCount: seed.jsCount,
+    rawCount: seed.rawCount,
+    urls: new Set(seed.urls),
+    inlineSecrets: [...(seed.inlineSecrets || [])],
+    dropped: { media: seed.dropped?.media || 0, js: seed.dropped?.js || 0 },
+    pages: 1,
+  };
+  const maxDepth = args.depth === 0 ? Infinity : args.depth;
+  const visited = new Set([dedupeKey(seed.finalUrl)]);
+  const seedDomain = registrableDomain(hostnameOfUrl(seed.finalUrl));
+  const sortNext = (list) => [...list].sort((a, b) => {
+    const ad = registrableDomain(hostnameOfUrl(a)) === seedDomain ? 0 : 1;
+    const bd = registrableDomain(hostnameOfUrl(b)) === seedDomain ? 0 : 1;
+    return ad - bd || (a < b ? -1 : a > b ? 1 : 0);
+  });
+  let queue = sortNext(seed.links || []).map((u) => ({ u, d: 2 }));
+  let pages = 1;
+
+  while (queue.length > 0 && pages < args.maxPages) {
+    if (globalThis.__INTERRUPTED) break;
+    const { u, d } = queue.shift();
+    const key = dedupeKey(u);
+    if (visited.has(key)) continue;
+    visited.add(key);
+    if (isStaticNoise(u) || isJsFile(u)) continue;
+    if (typeof args.inScope === 'function' && !args.inScope(u)) continue;
+
+    let r;
+    try {
+      r = await processSingleUrl(u, browser, args);
+    } catch {
+      if (args.verbose) info(`[WARN] crawl failed ${short(u, 80)}`);
+      continue;
+    }
+    if (!r.ok) continue;
+    pages++;
+    merged.rawCount += r.rawCount;
+    merged.jsCount += r.jsCount;
+    merged.dropped.media += r.dropped?.media || 0;
+    merged.dropped.js += r.dropped?.js || 0;
+    for (const x of r.urls) merged.urls.add(x);
+    for (const s of r.inlineSecrets || []) merged.inlineSecrets.push(s);
+
+    if (d < maxDepth) {
+      for (const l of sortNext(r.links || [])) {
+        if (!visited.has(dedupeKey(l))) queue.push({ u: l, d: d + 1 });
+      }
+      // bound memory on link-heavy sites (nearest links kept)
+      if (queue.length > args.maxPages * 10) queue = queue.slice(0, args.maxPages * 10);
+    }
+  }
+  merged.pages = pages;
+  if (args.verbose && pages > 1) {
+    info(`[CRAWL] ${short(seed.finalUrl, 70)}: ${pages} pages, ${merged.urls.size} urls`);
+  }
+  return merged;
 }
 
 async function processTarget(rawInput, browser, args) {
@@ -1236,6 +1781,9 @@ async function processTarget(rawInput, browser, args) {
     }
     try {
       const r = await processSingleUrl(targetUrl, browser, args);
+      if (r.ok && (args.depth === 0 || args.depth > 1) && r.links && r.links.size > 0) {
+        return await crawlDeeper(rawInput, r, browser, args);
+      }
       return { input: rawInput, ...r };
     } catch (e) {
       lastErr = String(e?.message?.split('\n')[0] || e);
@@ -1304,19 +1852,61 @@ async function main() {
     if (args.scope === 'host') return targetHosts.has(h);
     return targetDomains.has(registrableDomain(h)); // 'domain'
   };
+  args.inScope = inScope; // shared with the depth crawler (processTarget)
 
   const numWorkers = autoPageWorkers(targets.length);
   const unpackDir = deriveUnpackDir(outUrls, targets, args.outputExplicit);
   const mapPoolSize = args.fast ? JS_POOL_SIZE : MAP_POOL_SIZE;
   const mode = args.fast ? 'fast' : 'polite';
-  info(
-    `[*] Targets: ${targets.length} | workers=${numWorkers} js-pool=${JS_POOL_SIZE} map-pool=${mapPoolSize} (${mode}) rate-limit=per-host+${JITTER_MS}ms-jitter | wait=${args.wait}s | timeout=${args.timeout}s | strict=${args.strict} | scope=${args.scope} | out=${outUrls} + ${outJs} | sourcemap=${args.sourcemap ? `on(max-${args.maxMaps})->${unpackDir}` : 'off'} | secrets=${args.secrets ? 'on' : 'off'}`,
-  );
+  const depthValue = args.depth === 1
+    ? '1 (seed pages only)'
+    : `${args.depth === 0 ? '∞' : args.depth} (max ${args.maxPages} pages)`;
+  info(`[*] Targets: ${targets.length}`);
+  info(labelBlock([
+    ['mode', `${mode} · ${plural(numWorkers, 'worker')} · js-pool ${JS_POOL_SIZE} · map-pool ${mapPoolSize}`],
+    ['rate limit', `per-host + ${JITTER_MS}ms jitter`],
+    ['wait', `${args.wait}s`],
+    ['timeout', `${args.timeout}s`],
+    ['depth', depthValue],
+    ['robots', args.robots ? 'on' : 'off'],
+    ['sitemap', args.sitemap ? 'on' : 'off'],
+    ['strict', args.strict ? 'on' : 'off'],
+    ['scope', args.scope],
+    ['filters', `collapse ${args.collapse ? 'on' : 'off'} · js-noise ${args.jsFilter ? 'filtered' : 'kept'}`],
+    ['output', `${outUrls}\n${outJs}`],
+    ['sourcemaps', args.sourcemap ? `on (max ${args.maxMaps === 0 ? 500 : args.maxMaps}) -> ${unpackDir}/` : 'off'],
+    ['secrets', args.secrets ? 'on' : 'off'],
+  ]));
+  info('');
 
   const urlResults = new Set();
   const jsResults = new Set();
+  const urlPatterns = new Set(); // patternKey -> already have this shape
+  const jsPatterns = new Set();
+  const filterStats = { media: 0, js: 0, dup: 0 };
   const inlineSecretsAll = [];
   const droppedHosts = new Set(); // filtered third-party hosts, log summary only
+
+  /**
+   * Single insertion point for results: canonicalize, drop media/noise JS,
+   * then collapse uuid/hex/numeric-id patterns to one URL per shape.
+   */
+  const pushResult = (rawUrl) => {
+    const u = canonicalUrl(rawUrl);
+    if (isStaticNoise(u)) { filterStats.media++; return false; }
+    const js = isJsFile(u);
+    if (js && args.jsFilter && isNoiseJs(u)) { filterStats.js++; return false; }
+    if (args.collapse) {
+      const k = patternKey(u);
+      const seen = js ? jsPatterns : urlPatterns;
+      if (seen.has(k)) { filterStats.dup++; return false; }
+      seen.add(k);
+    }
+    const set = js ? jsResults : urlResults;
+    if (set.has(u)) return false;
+    set.add(u);
+    return true;
+  };
   let browser;
   try {
     browser = await chromium.launch({ headless: args.headless });
@@ -1332,7 +1922,7 @@ async function main() {
     if (dir && dir !== '.' && dir !== '') fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(file, [...set].sort().join('\n') + (set.size ? '\n' : ''));
   };
-  const saveAndExit = (code, extra = '') => {
+  const saveAndExit = (code, extras = []) => {
     try {
       writeList(outUrls, urlResults);
       writeList(outJs, jsResults);
@@ -1341,15 +1931,22 @@ async function main() {
       process.exit(4);
     }
     const dt = ((Date.now() - t0) / 1000).toFixed(1);
-    console.log(`\n[DONE] ${targets.length} targets in ${dt}s -> ${urlResults.size} urls (${outUrls}) + ${jsResults.size} js (${outJs})${extra}`);
+    const extraList = (Array.isArray(extras) ? extras : [extras]).filter(Boolean);
+    const rows = [
+      ['urls', `${urlResults.size}\n${outUrls}`],
+      ['js', `${jsResults.size}\n${outJs}`],
+    ];
+    if (extraList.length > 0) rows.push(['extra', extraList.join('\n')]);
+    console.log(`\n[DONE] ${plural(targets.length, 'target')} in ${dt}s\n${labelBlock(rows, 2)}`);
     if (args.verbose && args.scope !== 'all' && droppedHosts.size > 0) {
-      info(`[SCOPE] dropped third-party (${[...droppedHosts].sort().slice(0, 15).join(', ')}${droppedHosts.size > 15 ? ', …' : ''}) — ${droppedHosts.size} host(s). Use --scope all to keep.`);
+      info(`[SCOPE] dropped third-party (${[...droppedHosts].sort().slice(0, 15).join(', ')}${droppedHosts.size > 15 ? ', …' : ''}) — ${plural(droppedHosts.size, 'host')}. Use --scope all to keep.`);
     }
     process.exit(code);
   };
   process.on('SIGINT', () => {
     if (interrupted) process.exit(130);
     interrupted = true;
+    globalThis.__INTERRUPTED = true;
     console.log('\n[!] Interrupted — saving partial results…');
     saveAndExit(130);
   });
@@ -1402,16 +1999,20 @@ async function main() {
         let added = 0;
         let scoped = 0;
         const before = urlResults.size + jsResults.size;
-        for (const u of r.urls) {
-          if (isStaticNoise(u)) continue; // defense in depth: never output multimedia/style/font/xml
+        for (const raw of r.urls) {
+          const u = canonicalUrl(raw);
+          if (!u) continue;
           if (!inScope(u)) {
             const h = hostnameOfUrl(u);
             if (h) droppedHosts.add(h);
             continue;
           }
           scoped++;
-          if (isJsFile(u)) jsResults.add(u);
-          else urlResults.add(u);
+          pushResult(u);
+        }
+        if (r.dropped) {
+          filterStats.media += r.dropped.media || 0;
+          filterStats.js += r.dropped.js || 0;
         }
         if (Array.isArray(r.inlineSecrets)) {
           for (const s of r.inlineSecrets) {
@@ -1429,9 +2030,49 @@ async function main() {
   await Promise.all(workers);
   await saveChain.catch(() => {});
 
+  // robots.txt + sitemap.xml harvesting (logic ported from gospider).
+  // Same-origin and polite: one robots.txt + up to 6 sitemap files per origin,
+  // throttled per host, results go through the same scope/static filters.
+  const siteExtra = [];
+  if ((args.robots || args.sitemap) && !interrupted) {
+    const origins = [...new Set(targets.map(originOf).filter(Boolean))];
+    let robAdded = 0;
+    let mapAdded = 0;
+    let robotsOk = 0;
+    let sitemapsOk = 0;
+    const addScoped = (u) => {
+      if (!u || !inScope(u)) return false;
+      return pushResult(u);
+    };
+    info(`[*] robots/sitemap: checking ${origins.length} origin(s)`);
+    await mapPool(origins, 4, async (origin) => {
+      if (interrupted) return;
+      let sitemapSeeds = [];
+      if (args.robots) {
+        const r = await fetchRobots(origin, args.timeout);
+        const before = robAdded;
+        for (const u of r.urls) if (addScoped(u)) robAdded++;
+        if (robAdded > before) robotsOk++;
+        sitemapSeeds = r.sitemaps;
+      }
+      if (args.sitemap) {
+        const found = await fetchSitemap(origin, args.timeout, sitemapSeeds);
+        const before = mapAdded;
+        for (const u of found) if (addScoped(u)) mapAdded++;
+        if (mapAdded > before) sitemapsOk++;
+      }
+    });
+    if (robAdded || mapAdded) {
+      saveChain = saveChain.then(() => {
+        try { writeList(outUrls, urlResults); writeList(outJs, jsResults); } catch { /* final save retries */ }
+      }).catch(() => {});
+      siteExtra.push(`robots ${robAdded} (${plural(robotsOk, 'host')}) · sitemap ${mapAdded} (${plural(sitemapsOk, 'host')})`);
+    }
+  }
+
   // sourcemap auto-unpack: every in-scope .js -> .js.map (JS-only, like unwebpack)
   // polite by default: 2-wide, 1.5s/host gap, 429/503 backoff. --fast restores 12-wide.
-  let mapExtra = '';
+  const mapExtra = [];
   let mapsOk = 0;
   let filesOk = 0;
   const jsToSub = new Map();
@@ -1469,7 +2110,7 @@ async function main() {
       }
     });
     for (const m of foundMaps) {
-      if (!isStaticNoise(m) && inScope(m)) urlResults.add(m);
+      if (!isStaticNoise(m) && inScope(m)) pushResult(m);
     }
     if (foundMaps.length > 0) {
       try { writeList(outUrls, urlResults); } catch { /* saveAndExit retries */ }
@@ -1477,13 +2118,13 @@ async function main() {
     if (mapsOk === 0) {
       info(`[*] Sourcemaps: no valid .map with sourcesContent found`);
     } else {
-      mapExtra = ` + ${mapsOk} maps/${filesOk} files (${unpackDir}/)`;
+      mapExtra.push(`sourcemaps ${mapsOk} maps / ${filesOk} files -> ${unpackDir}/`);
     }
   }
 
   // secrets scan (tight, JS-only): fetched JS bodies + unpacked sources -> single file
   // format: <url-or-file> + hits, blocks separated by 2 blank lines + ==== bar. Empty sources skipped.
-  let secretsExtra = '';
+  const secretsExtra = [];
   let outSecrets = secretsSiblingFilename(outUrls);
   if (args.secrets && !interrupted) {
     const BAR = '='.repeat(80);
@@ -1551,15 +2192,20 @@ async function main() {
         console.error(`Failed to write secrets: ${e?.message || e}`);
       }
       info(`[*] Secrets: ${blocks.length} sources, ${nHits} hits -> ${outSecrets}`);
-      secretsExtra = ` + ${nHits} secrets (${outSecrets})`;
+      secretsExtra.push(`secrets ${nHits} hits -> ${outSecrets}`);
     } else {
       info(`[*] Secrets: clean (0 hits, no file written)`);
     }
-    mapExtra += secretsExtra;
+    mapExtra.push(...secretsExtra);
   }
 
   await browser.close().catch(() => {});
-  saveAndExit(0, mapExtra);
+  const filterExtra = [];
+  const dropped = filterStats.media + filterStats.js + filterStats.dup;
+  if (dropped > 0) {
+    filterExtra.push(`filtered ${filterStats.media} media · ${filterStats.js} noise js · ${filterStats.dup} duplicate patterns`);
+  }
+  saveAndExit(0, [...siteExtra, ...mapExtra, ...filterExtra]);
 }
 
 main().catch((e) => {

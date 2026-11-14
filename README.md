@@ -7,6 +7,34 @@ bookmarklets do: quoted `/paths` in HTML plus every loaded JS file, absolute
 `urls` + `js` files, plus auto-unpacked `.js.map` sources and a tight secrets
 scan.
 
+It also crawls like a real spider: DOM link graph (`a/area/iframe/form/data-*`),
+relative and escaped path resolution (`\/api\/x`, `\u002fapi`), LinkFinder
+quoted-string extraction, `robots.txt` rules and `sitemap.xml` (indexes
+recursed), plus opt-in depth crawling.
+
+## Output hygiene
+
+Results are cleaned while crawling, so junk is never fetched:
+
+- **No multimedia/style/font assets.** `jpg/png/gif/webp/avif/svg/ico/css/
+  woff2…` are always dropped — including `srcset` blobs, `wThumbnails/`,
+  image-optimizer URLs and trailing-slash variants.
+- **No fragments.** `#anchor` and JSON-LD ids (`#org`, `#website`, …) are
+  stripped; a fragment is not an endpoint.
+- **One URL per pattern.** UUID, long-hex and whole numeric-id variants
+  collapse to the first match; the host is never masked, date slugs stay
+  distinct (`--no-collapse` keeps every variant).
+- **No dead-weight JS.** Tag managers, analytics, consent widgets, service
+  workers and a11y checkers (`gtm`, `gtag`, `fbevents`, `waiChecker`, …) are
+  skipped before fetching. Chunks, `app`, `index`, `main`, `*.map`,
+  `Retire.js`, `instrument.*.js` and custom bundles stay (`--no-js-filter`
+  keeps everything).
+- **Canonical URLs.** Duplicate query suffixes (`?dpl=X?dpl=X`), trailing
+  slashes after a file extension and repeated `///` are normalised.
+
+The `[DONE]` summary reports the drops: `filtered 530 media · 55 noise js ·
+103 duplicate patterns`.
+
 ## Install
 
 Requires Node.js 18+.
@@ -30,7 +58,7 @@ Single-letter flags work without the dash (`u <url>` == `-u <url>`).
 Outputs never overwrite (explicit `-o` is the only overwriting case):
 single target gives `<domain>-urls.txt` + `<domain>-js.txt` (taken goes
 `-urls2`, `-urls3`…), multi-target gives `urls1/js1`, `urls2/js2`…,
-`-o foo.txt` gives `foo.txt` + `foo-js.txt`. Paths ending in `.js` go to
+`-o foo.txt` gives `foo.txt` + `foo-js.txt`. Paths ending in `.js`/`.mjs` go to
 the js file, everything else to urls. Found `.map` URLs are added to urls.
 
 Extras, all on by default: multimedia/font/style/xml filtering (images,
@@ -59,12 +87,20 @@ timing for your own infra.
 --js-timeout <s>         per-JS fetch timeout (default: 15, min 1)
 --wait <s>               settle wait after load (default: 3, 0 ok)
 --max-scripts <n>        max JS files per page (default: 100, max 1000)
+--depth <n>              crawl depth (default 1 = seed pages only; 2+ follows
+                         in-scope a/area/iframe/frame links; 0 = unlimited)
+--max-pages <n>          max extra pages crawled per target (default 25, max 500)
+--no-robots              skip robots.txt harvesting
+--no-sitemap             skip sitemap.xml harvesting (incl. indexes)
+--no-collapse            keep every uuid/hex/numeric-id URL variant
+--no-js-filter           keep noise JS (gtm, analytics, consent, waiChecker, sw)
 --headless / --no-headless
 --no-fallback            bare hosts: try https only (default tries https then http)
 --fallback               explicit https URL failing also tries http variant
 --strict                 exact bookmarklet quote handling (misses single-quoted paths)
 --no-inline              skip inline <script> bodies
---exclude-static         (always on, kept for compat)
+--exclude-static         (always on, kept for compat) media/css/font/xml
+                         filtered, pdf + PII-safe endpoints kept
 --no-sourcemap           disable .js.map auto-unpack (default: enabled, JS-only)
 --max-maps <n>           max .map files to try per run (default: 25, max 500)
 --no-secrets             disable tight secrets scan (default: enabled, JS-only)
