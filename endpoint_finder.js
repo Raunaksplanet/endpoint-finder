@@ -55,6 +55,88 @@ import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { extractWebpackChunkUrls } from './webpack_chunks.js';
+import { analyzeBody } from './lib/analyze/index.js';
+import { extractRPC } from './lib/analyze/rpc.js';
+
+// ---------------------------------------------------------------------------
+// Static analysis (JSHound port): parameters, GraphQL, RPC, files, emails.
+// The analyzers are pure and run on bodies that were already fetched.
+// ---------------------------------------------------------------------------
+function createAnalysis() {
+  return {
+    endpoints: new Set(),
+    parameters: new Set(),
+    graphql: new Set(),
+    rpcMethods: new Set(),
+    rpcPaths: new Set(),
+    files: new Set(),
+    emails: new Set(),
+  };
+}
+
+/**
+ * Analyze one body and merge the results into a run-wide accumulator.
+ * Never throws: a malformed body must not take a target down.
+ */
+function recordAnalysis(analysis, text) {
+  if (!text || !analysis) return null;
+  try {
+    const result = analyzeBody(text);
+    for (const value of result.endpoints) analysis.endpoints.add(value);
+    for (const value of result.parameters) analysis.parameters.add(value);
+    for (const value of result.graphql) analysis.graphql.add(value);
+    for (const value of result.files) analysis.files.add(value);
+    for (const value of result.emails) analysis.emails.add(value);
+    let rpc = { methods: [], paths: [] };
+    try { rpc = extractRPC(text); } catch { /* not RPC */ }
+    for (const value of rpc.methods) analysis.rpcMethods.add(value);
+    for (const value of rpc.paths) analysis.rpcPaths.add(value);
+    return result;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SSRF guard for discovered URLs. Operator-supplied targets (and their
+// hostnames) stay allowed; page-controlled URLs to private addresses do not
+// unless --allow-private is set. Literal hosts are checked synchronously; DNS
+// names that resolve privately are left to the operator's network policy.
+// ---------------------------------------------------------------------------
+const TARGET_HOSTS = new Set();
+
+function isPrivateHostname(host) {
+  const h = String(host || '').replace(/^\[|\]$/g, '').toLowerCase();
+  if (!h) return true;
+  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local')
+      || h.endsWith('.internal') || h === 'metadata.google.internal') return true;
+  const v4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])];
+    if (a === 0 || a === 10 || a === 127) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    return false;
+  }
+  if (h.includes(':')) {
+    if (h === '::1' || h === '::' || h.startsWith('fc') || h.startsWith('fd')
+        || h.startsWith('fe80:') || h.startsWith('::ffff:127.')) return true;
+  }
+  return false;
+}
+
+function hostAllowed(rawUrl) {
+  if (globalThis.__ALLOW_PRIVATE) return true;
+  try {
+    const h = new URL(rawUrl).hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    if (TARGET_HOSTS.has(h)) return true;
+    return !isPrivateHostname(h);
+  } catch {
+    return false;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Bookmarklet regex — native JS, exact copy
@@ -80,6 +162,26 @@ function extractPaths(text, strict = false) {
   return out;
 }
 
+// Template literals: `/api/users/${id}` is a real parameterised route, but the
+// bookmarklet character class stops at `$`, leaving a truncated `/api/users/`.
+// Rewrite each `${…}` to `:param` before the ordinary extractors see it.
+const TEMPLATE_PATH_RE = /(?<=["'`])((?:\/|\.{1,2}\/)[^"'`\n]*\$\{[^}\n]{0,200}\}[^"'`\n]*)(?=["'`])/g;
+
+function extractTemplatePaths(text) {
+  const out = new Set();
+  if (!text || !text.includes('${')) return out;
+  TEMPLATE_PATH_RE.lastIndex = 0;
+  for (const m of text.matchAll(TEMPLATE_PATH_RE)) {
+    const p = m[1].replace(/\$\{[^}]*\}/g, ':param');
+    if (p && p.length > 2) out.add(p);
+  }
+  return out;
+}
+
+/** True when `token` is the truncated prefix of a template literal route. */
+function isTruncatedTemplate(text, token) {
+  return Boolean(text && token && token.endsWith('/') && text.includes(token + '${'));
+}
 // Second bookmarklet, exact copy: absolute .js file URLs mentioned in
 // HTML/JS bodies — lazy chunks, dynamic imports, commented URLs that the
 // browser never loads as scripts (so tag + network collection misses them).
@@ -111,7 +213,7 @@ const STATIC_EXTS = new Set([
   '.avif', '.tif', '.tiff', '.heic', '.heif', '.psd', '.ai', '.eps', '.cur',
   // video
   '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm', '.mkv', '.m4v',
-  '.3gp', '.mpg', '.mpeg', '.ogv', '.m3u8', '.mpd', '.ts',
+  '.3gp', '.mpg', '.mpeg', '.ogv', '.m3u8', '.mpd',
   // audio
   '.mp3', '.wav', '.ogg', '.oga', '.m4a', '.aac', '.flac', '.wma', '.opus', '.mid', '.midi',
   // fonts
@@ -172,13 +274,20 @@ const HEX_RE = /\b[0-9a-f]{8,}\b/gi; // only 8+ hex runs; chunk names with g-z s
 const NUM_RE = /(?<=\/)\d{4,}(?=[/?#]|$)/g;
 
 function patternKey(absUrl) {
-  const mask = (s) => s.replace(UUID_RE, '{uuid}').replace(HEX_RE, '{hex}').replace(NUM_RE, '{num}');
+  const mask = (s, keepHex = false) => {
+    let out = s.replace(UUID_RE, '{uuid}');
+    if (!keepHex) out = out.replace(HEX_RE, '{hex}');
+    return out.replace(NUM_RE, '{num}');
+  };
   try {
     const u = new URL(absUrl);
     let p = u.pathname.replace(/\/+$/, '');
     if (!p) p = '/';
+    // A content hash in a JS filename identifies a real chunk. Masking it
+    // merges main.abc12345.js and main.def67890.js, hiding lazy chunks.
+    const keepHex = /\.(?:js|mjs|cjs)$/i.test(p);
     // never mask the host: hex-looking subdomains must stay distinct targets
-    return `${u.protocol}//${u.host}${mask(p)}${mask(u.search)}`;
+    return `${u.protocol}//${u.host}${mask(p, keepHex)}${mask(u.search, keepHex)}`;
   } catch {
     return mask(absUrl);
   }
@@ -374,11 +483,13 @@ function isStaticNoise(absUrl) {
       if (p.endsWith(ext)) return true;
     }
     const full = `${u.pathname}${u.search}`;
-    // srcset / responsive-image tokens: "img.jpg 383w, /img2.jpg 766w"
-    // (encoded spaces or literal commas joining multiple candidates)
-    if (/%20|%09/i.test(full)) return true;
+    // srcset / responsive-image tokens: "img.jpg 383w, /img2.jpg 766w".
+    // Do not drop a legitimate query value just because it contains %20.
     let decoded = full;
     try { decoded = decodeURIComponent(full); } catch { /* malformed % */ }
+    if (/(?:%20|%09)/i.test(full)
+        && /\.(?:jpe?g|png|gif|webp|avif|svg|ico|bmp|tiff?)(?:[^a-z0-9]|$)/i.test(decoded)
+        && /(?:,\s*|\s+\d+[wx]\b)/.test(decoded)) return true;
     if (/\.(?:jpe?g|png|gif|webp|avif|svg|ico|bmp|tiff?|css)(?:[^a-z0-9]|$)/i.test(decoded)) return true;
     // image optimizer endpoints (/ _next/image?url=...webp) and thumbnails
     if (/\/wthumbnails\//i.test(p)) return true;
@@ -575,7 +686,18 @@ function deriveUnpackDir(outUrls, targets, outputExplicit) {
 function isJsFile(absUrl) {
   try {
     const p = new URL(absUrl).pathname.toLowerCase().replace(/\/+$/, '');
-    return p.endsWith('.js') || p.endsWith('.mjs');
+    return p.endsWith('.js') || p.endsWith('.mjs') || p.endsWith('.cjs');
+  } catch {
+    return false;
+  }
+}
+
+/** Network sniffer: real JS path or a JavaScript content-type. */
+function looksLikeJsResponse(rawUrl, contentType) {
+  if (/javascript|ecmascript/i.test(contentType || '')) return true;
+  try {
+    const p = new URL(rawUrl).pathname.toLowerCase().replace(/\/+$/, '');
+    return p.endsWith('.js') || p.endsWith('.mjs') || p.endsWith('.cjs');
   } catch {
     return false;
   }
@@ -590,31 +712,48 @@ const MAX_SOURCEMAP_BYTES = 8_000_000;
 function mapCandidatesForJs(jsUrl, jsBody) {
   const out = [];
   const push = (u) => { if (u && !out.includes(u)) out.push(u); };
-  // 1. sourceMappingURL comment (same as unwebpack _detect: last line)
+  // 1. sourceMappingURL directive anywhere in the file, both //# and /*# */
   try {
     if (jsBody) {
-      const lines = jsBody.trimEnd().split('\n');
-      const last = (lines[lines.length - 1] || '').slice(-2000);
-      const m = last.match(/\/\/#\s*sourceMappingURL=(.*)\s*$/);
-      if (m) {
-        const asset = (m[1] || '').trim();
-        if (asset && !asset.startsWith('data:')) {
+      const re = /(?:\/\/[#@]\s*sourceMappingURL=([^\s'"]+)|\/\*[#@]\s*sourceMappingURL=([^*]+?)\s*\*\/)/g;
+      let last = null;
+      let m;
+      while ((m = re.exec(jsBody)) !== null) last = m;
+      if (last) {
+        const asset = (last[1] || last[2] || '').trim();
+        if (asset.startsWith('data:')) push(asset);
+        else {
           try { push(new URL(asset, jsUrl).href); } catch { /* bad */ }
         }
       }
     }
   } catch { /* ignore */ }
-  // 2. conventional <file.js>.map (query/hash stripped)
+  // 2. conventional <file>.js.map (query/hash stripped)
   try {
     const u = new URL(jsUrl);
     u.hash = '';
     u.search = '';
-    if (u.pathname.toLowerCase().endsWith('.js')) {
+    if (/\.(?:js|mjs|cjs)$/i.test(u.pathname)) {
       u.pathname = `${u.pathname}.map`;
       push(u.href);
     }
   } catch { /* ignore */ }
-  return out.slice(0, 2);
+  return out.slice(0, 3);
+}
+
+/** Decode an inline base64/text source map. */
+function decodeDataUrl(dataUrl) {
+  const comma = dataUrl.indexOf(',');
+  if (comma < 0) return null;
+  const meta = dataUrl.slice(5, comma);
+  const data = dataUrl.slice(comma + 1);
+  try {
+    return /;base64/i.test(meta)
+      ? Buffer.from(data, 'base64').toString('utf8')
+      : decodeURIComponent(data);
+  } catch {
+    return null;
+  }
 }
 
 function sanitizeFsName(name, st) {
@@ -636,19 +775,30 @@ function isUnderRoot(root, child) {
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
 }
 
+/** Flatten top-level sources and indexed-map sections into source pairs. */
+function collectMapSources(obj, out) {
+  if (!obj || typeof obj !== 'object') return;
+  if (Array.isArray(obj.sources) && Array.isArray(obj.sourcesContent)) {
+    const n = Math.min(obj.sources.length, obj.sourcesContent.length);
+    for (let i = 0; i < n; i++) out.push([obj.sources[i], obj.sourcesContent[i]]);
+  }
+  if (Array.isArray(obj.sections)) {
+    for (const section of obj.sections) collectMapSources(section?.map, out);
+  }
+}
+
 function unpackSourcemapText(mapText, destRoot) {
   let obj;
-  try { obj = JSON.parse(mapText); } catch { return 0; }
-  if (!obj || !Array.isArray(obj.sources) || !Array.isArray(obj.sourcesContent)) return 0;
-  const n = Math.min(obj.sources.length, obj.sourcesContent.length);
-  if (n === 0) return 0;
+  try { obj = JSON.parse(mapText); } catch { return { count: 0, files: [] }; }
+  const pairs = [];
+  collectMapSources(obj, pairs);
+  if (pairs.length === 0) return { count: 0, files: [] };
   const root = path.resolve(destRoot);
   fs.mkdirSync(root, { recursive: true });
   const st = { n: 0 };
-  let wrote = 0;
-  for (let i = 0; i < n; i++) {
-    const src = obj.sources[i];
-    const content = obj.sourcesContent[i];
+  const used = new Set();
+  const files = [];
+  for (const [src, content] of pairs) {
     if (typeof src !== 'string' || typeof content !== 'string') continue;
     let p = src.replace('webpack:///', '');
     if (p.split(' ')[0] === 'external') continue; // same as unwebpack
@@ -663,15 +813,25 @@ function unpackSourcemapText(mapText, destRoot) {
     if (!file) file = `empty_${st.n++}`;
     const dirParts = dir.split('/').filter(Boolean).map((c) => sanitizeFsName(c, st));
     const safeFile = sanitizeFsName(file, st);
-    const dest = path.resolve(root, ...dirParts, safeFile);
+    let dest = path.resolve(root, ...dirParts, safeFile);
     if (!isUnderRoot(root, dest)) continue;
+    // Collision-safe: two sources can sanitize to the same name.
+    if (used.has(dest) || fs.existsSync(dest)) {
+      const dot = dest.lastIndexOf('.');
+      const stem = dot > dest.lastIndexOf(path.sep) ? dest.slice(0, dot) : dest;
+      const ext = dot > dest.lastIndexOf(path.sep) ? dest.slice(dot) : '';
+      let n = 2;
+      while (used.has(`${stem}-${n}${ext}`) || fs.existsSync(`${stem}-${n}${ext}`)) n++;
+      dest = `${stem}-${n}${ext}`;
+    }
+    used.add(dest);
     try {
       fs.mkdirSync(path.dirname(dest), { recursive: true });
       fs.writeFileSync(dest, content, 'utf8');
-      wrote++;
+      files.push(dest);
     } catch { /* skip */ }
   }
-  return wrote;
+  return { count: files.length, files };
 }
 
 function subdirForJs(jsUrl, taken) {
@@ -753,14 +913,19 @@ function scanSecrets(text) {
 
 /** Secrets sibling: <base>-urls.txt -> <base>-secrets.txt (first free, never overwrites). */
 function secretsSiblingFilename(outUrls) {
+  return artifactSiblingFilename(outUrls, 'secrets');
+}
+
+/** First free sibling path for a named artifact: foo-urls.txt -> foo-params.txt. */
+function artifactSiblingFilename(outUrls, kind) {
   const dir = path.dirname(outUrls);
   const baseDir = (!dir || dir === '' || dir === '.') ? '.' : dir;
   const file = path.basename(outUrls);
   let name;
-  if (/urls/i.test(file)) name = file.replace(/urls/i, 'secrets');
+  if (/urls/i.test(file)) name = file.replace(/urls/i, kind);
   else {
     const dot = file.lastIndexOf('.');
-    name = dot > 0 ? `${file.slice(0, dot)}-secrets${file.slice(dot)}` : `${file}-secrets.txt`;
+    name = dot > 0 ? `${file.slice(0, dot)}-${kind}${file.slice(dot)}` : `${file}-${kind}.txt`;
   }
   let full = path.join(baseDir, name);
   if (!fs.existsSync(full)) return full;
@@ -866,29 +1031,77 @@ const jsCache = new Map(); // url -> Promise<string|null> (shared across targets
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
+/** Read at most maxBytes from a response without buffering the whole body. */
+async function readCapped(res, maxBytes) {
+  const declared = Number(res.headers.get('content-length') || 0);
+  if (!res.body) {
+    const text = await res.text();
+    return text.length > maxBytes ? text.slice(0, maxBytes) : text;
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let out = '';
+  let read = 0;
+  try {
+    while (read < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      read += value.byteLength;
+      out += decoder.decode(value, { stream: true });
+      if (out.length >= maxBytes) break;
+    }
+    out += decoder.decode();
+  } finally {
+    try { await reader.cancel(); } catch { /* already closed */ }
+  }
+  // The declared length is only a hint, but a huge one is worth logging.
+  if (declared > maxBytes && globalThis.__VERBOSE) {
+    console.log(`[CAP] ${declared} bytes declared, reading ${maxBytes}`);
+  }
+  return out.length > maxBytes ? out.slice(0, maxBytes) : out;
+}
+
 async function fetchTextOnce(url, timeoutSec, maxBytes = 8_000_000) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutSec * 1000);
   try {
-    const res = await fetch(url, {
-      signal: ctrl.signal,
-      redirect: 'follow',
-      headers: { 'User-Agent': globalThis.__UA },
-    });
-    if (res.status === 429 || res.status === 503) {
-      const ra = res.headers.get('retry-after');
-      const waitSec = ra ? (parseInt(ra, 10) || 5) : 5;
-      try { await res.text().catch(() => {}); } catch { /* drain */ }
-      return { retry: true, waitMs: Math.min(waitSec * 1000, 30000), status: res.status };
+    let current = url;
+    for (let hop = 0; hop <= 5; hop++) {
+      if (!hostAllowed(current)) {
+        if (globalThis.__VERBOSE) console.log(`[GUARD] blocked private host: ${current.slice(0, 120)}`);
+        return null;
+      }
+      const res = await fetch(current, {
+        signal: ctrl.signal,
+        redirect: 'manual',
+        headers: { 'User-Agent': globalThis.__UA },
+      });
+      if (res.status >= 300 && res.status < 400) {
+        const loc = res.headers.get('location');
+        if (!loc) return null;
+        try { current = new URL(loc, current).href; } catch { return null; }
+        try { await res.body?.cancel(); } catch { /* ignore */ }
+        continue;
+      }
+      if (res.status === 429 || res.status === 503) {
+        const ra = res.headers.get('retry-after');
+        const waitSec = ra ? (parseInt(ra, 10) || 5) : 5;
+        try { await res.text().catch(() => {}); } catch { /* drain */ }
+        return { retry: true, waitMs: Math.min(waitSec * 1000, 30000), status: res.status };
+      }
+      if (res.status === 500 || res.status === 502 || res.status === 504) {
+        try { await res.text().catch(() => {}); } catch { /* drain */ }
+        return { retry: true, waitMs: 1000 + Math.random() * 1000, status: res.status };
+      }
+      if (res.status >= 400) return null;
+      const ctype = (res.headers.get('content-type') || '').toLowerCase();
+      if (/image\/|video\/|audio\/|font|\boctet-stream\b/.test(ctype)) {
+        const low = current.toLowerCase().split('?')[0].split('#')[0];
+        if (!low.endsWith('.js') && !low.endsWith('.mjs') && !low.endsWith('.cjs') && !low.endsWith('.map')) return null;
+      }
+      return await readCapped(res, maxBytes);
     }
-    if (res.status >= 400) return null;
-    const ctype = (res.headers.get('content-type') || '').toLowerCase();
-    if (/image\/|video\/|audio\/|font|\boctet-stream\b/.test(ctype)) {
-      const low = url.toLowerCase().split('?')[0].split('#')[0];
-      if (!low.endsWith('.js') && !low.endsWith('.map')) return null;
-    }
-    const text = await res.text();
-    return text.length > maxBytes ? text.slice(0, maxBytes) : text;
+    return { retry: true, waitMs: 1000, status: 0 }; // too many redirects
   } catch {
     return { retry: true, waitMs: 1500, status: 0 }; // timeout/hang -> retryable
   } finally {
@@ -1086,6 +1299,7 @@ function parseArgs(argv) {
     strict: false,
     noInline: false,
     excludeStatic: false,
+    allowPrivate: false,
     sourcemap: true,
     maxMaps: 25,
     secrets: true,
@@ -1122,9 +1336,17 @@ function parseArgs(argv) {
       case '--timeout': args.timeout = Math.max(1, parseFloat(need(t)) || 30); i++; break;
       case '--js-timeout': args.jsTimeout = Math.max(1, parseFloat(need(t)) || 15); i++; break;
       case '--wait': args.wait = parseFloat(need(t)); if (Number.isNaN(args.wait) || args.wait < 0) args.wait = 3; i++; break;
-      case '--max-scripts': args.maxScripts = Math.min(1000, Math.max(0, parseInt(need(t), 10) || 0)); i++; break;
+      case '--max-scripts': {
+        const n = parseInt(need(t), 10);
+        args.maxScripts = Number.isNaN(n) ? 100 : Math.min(1000, Math.max(0, n));
+        i++; break;
+      }
       case '--no-webpack': args.webpack = false; i++; break;
-      case '--max-chunks': args.maxChunks = Math.min(500, Math.max(0, parseInt(need(t), 10) || 0)); i++; break;
+      case '--max-chunks': {
+        const n = parseInt(need(t), 10);
+        args.maxChunks = Number.isNaN(n) ? 80 : Math.min(500, Math.max(0, n));
+        i++; break;
+      }
       case '--depth': {
         const n = parseInt(need(t), 10);
         args.depth = Number.isNaN(n) ? 1 : Math.min(5, Math.max(0, n)); // 0 = unlimited (bounded by --max-pages)
@@ -1142,8 +1364,13 @@ function parseArgs(argv) {
       case '--strict': args.strict = true; i++; break;
       case '--no-inline': args.noInline = true; i++; break;
       case '--exclude-static': args.excludeStatic = true; i++; break;
+      case '--allow-private': args.allowPrivate = true; i++; break;
       case '--no-sourcemap': args.sourcemap = false; i++; break;
-      case '--max-maps': args.maxMaps = Math.min(500, Math.max(0, parseInt(need(t), 10) || 0)); i++; break;
+      case '--max-maps': {
+        const n = parseInt(need(t), 10);
+        args.maxMaps = Number.isNaN(n) ? 25 : Math.min(500, Math.max(0, n));
+        i++; break;
+      }
       case '--no-secrets': args.secrets = false; i++; break;
       case '--fast': args.fast = true; i++; break;
       case '--scope': {
@@ -1199,7 +1426,8 @@ Usage:
   rate limiting and jitter (no thread flags needed, IP-ban safe).
 
   Output file is auto-named from the target unless -o is given:
-  dell.com -> dell.com-endpoints.txt
+  example.com -> example.com-urls.txt + example.com-js.txt
+  (params/graphql/rpc/files/emails siblings are added when non-empty)
 
 Options:
   -i, --input <file|url>   file with targets (one per line) or a single URL/host
@@ -1236,6 +1464,8 @@ Options:
   --strict                 exact bookmarklet quote handling (misses single-quoted paths)
   --no-inline              skip inline <script> bodies
   --exclude-static         (always on, kept for compat) multimedia/style/font/xml filtered, pdf+PII kept
+  --allow-private          allow discovered URLs to private/link-local hosts
+                           (default: blocked unless the host is a target)
   --no-sourcemap           disable .js.map auto-unpack (default: enabled, JS-only)
   --max-maps <n>           max .map files to try per run (default: 25, max 500, 0=unlimited->capped 500)
   --no-secrets             disable tight secrets scan (default: enabled, JS-only)
@@ -1376,7 +1606,7 @@ async function processSingleUrl(targetUrl, browser, args) {
     try {
       const u = resp.url();
       const ctype = (resp.headers()['content-type'] || '').toLowerCase();
-      if (u.split('?')[0].includes('.js') || ctype.includes('javascript')) {
+      if (looksLikeJsResponse(u, ctype)) {
         if (!shouldSkipScriptSrc(u)) networkJs.add(u);
       }
     } catch { /* ignore */ }
@@ -1421,7 +1651,9 @@ async function processSingleUrl(targetUrl, browser, args) {
     const collectTagSrcs = async () => {
       const found = new Set();
       try {
-        const srcs = await page.$$eval('script[src]', (els) => els.map((e) => e.src));
+        const srcs = await page.$$eval('script[src]', (els) => els
+          .map((e) => e.getAttribute('src'))
+          .filter((s) => s && s.trim()));
         for (const s of srcs || []) {
           if (shouldSkipScriptSrc(s)) continue;
           try {
@@ -1495,9 +1727,25 @@ async function processSingleUrl(targetUrl, browser, args) {
 
     const harvest = (text, base) => {
       if (!text) return;
+      // 0. classified static analysis (JSHound port): parameters, GraphQL,
+      //    RPC, files, emails. Endpoints recovered here are resolved through
+      //    the same addCand path as the bookmarklet layers.
+      const analyzed = recordAnalysis(args.analysis, text);
+      if (analyzed) {
+        for (const p of analyzed.endpoints) {
+          if (isTruncatedTemplate(text, p)) continue;
+          rawSeen.add(p);
+          addCand(p.replace(/\{([^}]+)\}/g, ':$1'), base);
+        }
+      }
+      // 0b. template literals: `/api/users/${id}` -> `/api/users/:param`
+      for (const p of extractTemplatePaths(text)) {
+        rawSeen.add(p);
+        addCand(p, base);
+      }
       // 1. bookmarklet regex (exact original mechanism)
       for (const p of extractPaths(text, args.strict)) {
-        if (!p) continue;
+        if (!p || isTruncatedTemplate(text, p)) continue;
         rawSeen.add(p);
         addCand(p, base);
       }
@@ -1505,13 +1753,14 @@ async function processSingleUrl(targetUrl, browser, args) {
       const dec = decodeEscapes(text);
       if (dec !== text) {
         for (const p of extractPaths(dec, args.strict)) {
-          if (!p) continue;
+          if (!p || isTruncatedTemplate(dec, p)) continue;
           rawSeen.add(p);
           addCand(p, base);
         }
       }
       // 3. gospider LinkFinder: relative ./ ../ api/v1/x, query paths, file.ext
       for (const t of extractLinkfinder(text)) {
+        if (isTruncatedTemplate(text, t)) continue;
         rawSeen.add(t);
         addCand(t, base); // NOTE: endpoints only — never crawl seeds
       }
@@ -1575,15 +1824,19 @@ async function processSingleUrl(targetUrl, browser, args) {
         const inlines = await page.$$eval('script:not([src])', (els) =>
           els.map((e) => e.textContent || ''),
         );
+        let inlineIdx = 0;
         for (const body of inlines || []) {
           if (!body) continue;
+          inlineIdx++;
           inlineBodies.push(body);
           harvest(body, finalUrl);
           // inline bodies are never fetched, so scan them here (small, sync, capped)
           if (args.secrets && body.length <= 500_000) {
             let hits;
             try { hits = scanSecrets(body); } catch { hits = []; }
-            if (hits.length > 0) inlineSecrets.push({ header: `${finalUrl} (inline)`, hits });
+            if (hits.length > 0) {
+              inlineSecrets.push({ header: `${finalUrl} (inline #${inlineIdx})`, hits });
+            }
             if (inlineSecrets.length >= 50) break;
           }
         }
@@ -1793,6 +2046,7 @@ async function crawlDeeper(rawInput, seed, browser, args) {
     visited.add(key);
     if (isStaticNoise(u) || isJsFile(u)) continue;
     if (typeof args.inScope === 'function' && !args.inScope(u)) continue;
+    if (!hostAllowed(u)) continue;
 
     let r;
     try {
@@ -1829,7 +2083,6 @@ async function crawlDeeper(rawInput, seed, browser, args) {
 async function processTarget(rawInput, browser, args) {
   const stripped = rawInput.trim();
   const isExplicit = /^https?:\/\//i.test(stripped);
-  const isProtoRel = stripped.startsWith('//');
   let tried = candidateUrls(rawInput);
   if (isExplicit && !args.fallback) tried = tried.slice(0, 1);
   if (args.noFallback) tried = tried.slice(0, 1);
@@ -1865,7 +2118,7 @@ async function processTarget(rawInput, browser, args) {
     } catch (e) {
       lastErr = String(e?.message?.split('\n')[0] || e);
       if (args.verbose) info(`[RETRY] ${short(rawInput)} via ${short(targetUrl)} failed: ${lastErr}`);
-      if ((isExplicit || isProtoRel) && !args.fallback) break;
+      if (isExplicit && !args.fallback) break;
     }
   }
   return { input: rawInput, ok: false, error: lastErr || 'unreachable', urls: new Set() };
@@ -1889,6 +2142,18 @@ async function main() {
   }
 
   const targets = await loadTargets(args);
+
+  // SSRF guard: operator-supplied target hosts are always allowed; discovered
+  // URLs to private/link-local addresses are blocked unless --allow-private.
+  globalThis.__ALLOW_PRIVATE = args.allowPrivate;
+  for (const t of targets) {
+    const h = targetHostname(t);
+    if (h) TARGET_HOSTS.add(h.toLowerCase());
+  }
+
+  // Run-wide static-analysis accumulator (JSHound port).
+  const analysis = createAnalysis();
+  args.analysis = analysis;
 
   // output files — always a urls + js pair, never combined, never overwrites
   // (explicit -o is the only overwriting case, because you named it):
@@ -1917,6 +2182,16 @@ async function main() {
       }
     } catch { /* input is a URL, not a file — no clash possible */ }
   }
+
+  // Sibling artifacts derived from the urls filename (first free, never
+  // overwrites). Empty sets are not written.
+  const artifactFiles = {
+    params: artifactSiblingFilename(outUrls, 'params'),
+    graphql: artifactSiblingFilename(outUrls, 'graphql'),
+    rpc: artifactSiblingFilename(outUrls, 'rpc'),
+    files: artifactSiblingFilename(outUrls, 'files'),
+    emails: artifactSiblingFilename(outUrls, 'emails'),
+  };
 
   // in-scope sets derived from the entered targets
   const targetHosts = new Set(targets.map(targetHostname).filter(Boolean));
@@ -1954,6 +2229,7 @@ async function main() {
     ['output', `${outUrls}\n${outJs}`],
     ['sourcemaps', args.sourcemap ? `on (max ${args.maxMaps === 0 ? 500 : args.maxMaps}) -> ${unpackDir}/` : 'off'],
     ['secrets', args.secrets ? 'on' : 'off'],
+    ['analysis', 'params · graphql · rpc · files · emails'],
   ]));
   info('');
 
@@ -1964,6 +2240,7 @@ async function main() {
   const filterStats = { media: 0, js: 0, dup: 0 };
   const inlineSecretsAll = [];
   const droppedHosts = new Set(); // filtered third-party hosts, log summary only
+  const finalOrigins = new Set(); // post-redirect origins that actually worked
 
   /**
    * Single insertion point for results: canonicalize, drop media/noise JS,
@@ -2008,11 +2285,29 @@ async function main() {
       console.error(`Failed to write output: ${e?.message || e}`);
       process.exit(4);
     }
+    const artifactRows = [];
+    const artifacts = [
+      ['params', artifactFiles.params, analysis.parameters],
+      ['graphql', artifactFiles.graphql, analysis.graphql],
+      ['rpc', artifactFiles.rpc, analysis.rpcMethods],
+      ['files', artifactFiles.files, analysis.files],
+      ['emails', artifactFiles.emails, analysis.emails],
+    ];
+    for (const [label, file, set] of artifacts) {
+      if (!set || set.size === 0) continue;
+      try {
+        writeList(file, set);
+        artifactRows.push([label, `${set.size}\n${file}`]);
+      } catch (e) {
+        console.error(`Failed to write ${label}: ${e?.message || e}`);
+      }
+    }
     const dt = ((Date.now() - t0) / 1000).toFixed(1);
     const extraList = (Array.isArray(extras) ? extras : [extras]).filter(Boolean);
     const rows = [
       ['urls', `${urlResults.size}\n${outUrls}`],
       ['js', `${jsResults.size}\n${outJs}`],
+      ...artifactRows,
     ];
     if (extraList.length > 0) rows.push(['extra', extraList.join('\n')]);
     console.log(`\n[DONE] ${plural(targets.length, 'target')} in ${dt}s\n${labelBlock(rows, 2)}`);
@@ -2033,6 +2328,7 @@ async function main() {
   // progress is checkpointed to disk every 10 targets so long runs survive crashes.
   let next = 0;
   let doneCount = 0;
+  let failedTargets = 0;
   let saveChain = Promise.resolve();
   const checkpoint = () => {
     doneCount++;
@@ -2065,12 +2361,14 @@ async function main() {
           const msg = String(e?.message?.split('\n')[0] || e);
           if (globalThis.__QUIET) console.log(`[FAIL] ${short(input)} (${msg})`);
           else console.log(failRow(input, msg));
+          failedTargets++;
           checkpoint();
           continue;
         }
         if (!r.ok) {
           if (globalThis.__QUIET) console.log(`[FAIL] ${short(input)} (${r.error})`);
           else console.log(failRow(input, r.error));
+          failedTargets++;
           checkpoint();
           continue;
         }
@@ -2100,6 +2398,8 @@ async function main() {
           }
         }
         added = (urlResults.size + jsResults.size) - before;
+        const origin = originOf(r.finalUrl);
+        if (origin) finalOrigins.add(origin);
         info(okRow(r.finalUrl, r.jsCount, r.wpChunks || 0, r.rawCount, scoped, added));
         checkpoint();
       }
@@ -2113,7 +2413,9 @@ async function main() {
   // throttled per host, results go through the same scope/static filters.
   const siteExtra = [];
   if ((args.robots || args.sitemap) && !interrupted) {
-    const origins = [...new Set(targets.map(originOf).filter(Boolean))];
+    const origins = [...new Set(
+      (finalOrigins.size > 0 ? [...finalOrigins] : targets.map(originOf)).filter(Boolean),
+    )];
     let robAdded = 0;
     let mapAdded = 0;
     let robotsOk = 0;
@@ -2160,6 +2462,45 @@ async function main() {
     info(`[*] Sourcemaps (${mode}): trying ${jsList.length} .js.map -> ${unpackDir}/`);
     const taken = new Set();
     const foundMaps = [];
+    // Recovered sources are the richest endpoint source in modern SPAs; run
+    // the same static analyzers on them instead of only scanning for secrets.
+    const harvestUnpacked = (files, baseUrl) => {
+      for (const f of files) {
+        if (interrupted) break;
+        let text;
+        try {
+          const buf = fs.readFileSync(f);
+          if (buf.includes(0)) continue;
+          text = buf.toString('utf8');
+        } catch { continue; }
+        if (!text) continue;
+        const analyzed = recordAnalysis(analysis, text);
+        if (analyzed) {
+          for (const p of analyzed.endpoints) {
+            let abs;
+            try { abs = resolveAny(baseUrl, p.replace(/\{([^}]+)\}/g, ':$1')); } catch { continue; }
+            if (!abs) continue;
+            const c = canonicalUrl(abs);
+            if (inScope(c)) pushResult(c);
+          }
+        }
+        for (const p of extractTemplatePaths(text)) {
+          let abs;
+          try { abs = resolveAny(baseUrl, p); } catch { continue; }
+          if (abs) { const c = canonicalUrl(abs); if (inScope(c)) pushResult(c); }
+        }
+        for (const t of extractLinkfinder(text)) {
+          const abs = resolveRelative(baseUrl, t);
+          if (!abs) continue;
+          const c = canonicalUrl(abs);
+          if (inScope(c)) pushResult(c);
+        }
+        for (const u of extractJsUrls(text)) {
+          const c = canonicalUrl(u);
+          if (inScope(c)) pushResult(c);
+        }
+      }
+    };
     await mapPool(jsList, mapPoolSize, async (jsUrl) => {
       if (interrupted) return;
       let jsBody = null;
@@ -2168,21 +2509,26 @@ async function main() {
       for (const mapUrl of cands) {
         if (interrupted) return;
         let txt = null;
-        try {
-          txt = args.fast
-            ? await fetchText(mapUrl, args.jsTimeout, MAX_SOURCEMAP_BYTES)
-            : await fetchMapText(mapUrl, args.jsTimeout);
-        } catch { txt = null; }
+        if (mapUrl.startsWith('data:')) {
+          txt = decodeDataUrl(mapUrl);
+        } else {
+          try {
+            txt = args.fast
+              ? await fetchText(mapUrl, args.jsTimeout, MAX_SOURCEMAP_BYTES)
+              : await fetchMapText(mapUrl, args.jsTimeout);
+          } catch { txt = null; }
+        }
         if (!txt) continue;
         const sub = subdirForJs(jsUrl, taken);
         const dest = path.join(unpackDir, sub);
-        const n = unpackSourcemapText(txt, dest);
-        if (n > 0) {
+        const unpacked = unpackSourcemapText(txt, dest);
+        if (unpacked.count > 0) {
           mapsOk++;
-          filesOk += n;
-          foundMaps.push(mapUrl);
+          filesOk += unpacked.count;
+          if (!mapUrl.startsWith('data:')) foundMaps.push(mapUrl);
           jsToSub.set(jsUrl, sub);
-          info(`[MAP] ${short(jsUrl, 70)} -> ${short(mapUrl, 70)} (${n} files in ${sub}/)`);
+          info(`[MAP] ${short(jsUrl, 70)} -> ${short(mapUrl, 70)} (${unpacked.count} files in ${sub}/)`);
+          harvestUnpacked(unpacked.files, jsUrl);
           break; // one good map per js is enough
         }
       }
@@ -2283,7 +2629,8 @@ async function main() {
   if (dropped > 0) {
     filterExtra.push(`filtered ${filterStats.media} media · ${filterStats.js} noise js · ${filterStats.dup} duplicate patterns`);
   }
-  saveAndExit(0, [...siteExtra, ...mapExtra, ...filterExtra]);
+  const exitCode = targets.length > 0 && failedTargets === targets.length ? 1 : 0;
+  saveAndExit(exitCode, [...siteExtra, ...mapExtra, ...filterExtra]);
 }
 
 main().catch((e) => {
